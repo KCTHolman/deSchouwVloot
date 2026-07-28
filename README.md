@@ -1,11 +1,18 @@
-# deFleet — een AI-native CI/CD-pijplijn, als showcase
+# deSchouwVloot — een AI-native CI/CD-pijplijn, als showcase
 
 Gedeelde gitflow- en runner-infrastructuur voor meerdere projecten: herbruikbare workflows, een
 routerende intake-poort, en een set machinaal toetsbare invarianten die de pijplijn zichzelf laten
 bewaken. Geen productcode, geen domeinlogica, geen data — alleen de machinerie zelf.
 
+Hierna kortweg **de Vloot**.
+
 Dit is een **gecureerde, publieke kopie** van een privé-productierepo. Wat hier staat draait
 echt; wat eruit is gehaald staat hieronder expliciet benoemd.
+
+> **Over de naamgeving.** Bestandsnamen en scripts dragen nog het `fleet`-voorvoegsel —
+> `.fleet.yml`, `fleet-doctor.sh`, het `fleet-task`-label. Dat is bewust: dat zijn echte
+> identifiers waar code en tests aan hangen, geen proza. De naam in de tekst is veranderd, de
+> contracten niet.
 
 ---
 
@@ -46,7 +53,7 @@ on:
   pull_request:
 jobs:
   checks:
-    uses: KCTHolman/fleet/.github/workflows/checks.yml@main
+    uses: KCTHolman/deSchouwVloot/.github/workflows/checks.yml@main
     secrets: inherit
 ```
 
@@ -56,7 +63,7 @@ Het dragende mechanisme is dat een reusable workflow draait in de **context van 
 - `github.repository` is de *aanroepende* repo, niet deze;
 - `secrets: inherit` geeft de secrets van de *aanroeper* door.
 
-deFleet levert dus de logica, de consument levert de hardware en de secrets. Dat is ook waarom dit
+De Vloot levert dus de logica, de consument levert de hardware en de secrets. Dat is ook waarom dit
 werkt zonder GitHub-organisatie: er zijn geen org-level runners of org-secrets nodig.
 
 Het contract tussen beide is één bestand: [`.fleet.yml`](.fleet.yml). Lanes, poorten, budgetten,
@@ -98,7 +105,7 @@ inline lijstvorm `on: [push, pull_request]`.
 [`scripts/check-no-triggers.test.sh`](scripts/check-no-triggers.test.sh) toetst al die gevallen.
 
 De voorbeeld-caller in [`examples/`](examples/) heeft wél een echte trigger — dat hoort ook, want
-dat is nou juist het punt: **triggers leven in de consument, logica in de fleet.** Bestanden in
+dat is nou juist het punt: **triggers leven in de consument, logica in de Vloot.** Bestanden in
 `examples/` staan buiten `.github/workflows/` en worden door GitHub nooit geregistreerd.
 
 ### Wat er uit deze kopie is gehaald, en waarom
