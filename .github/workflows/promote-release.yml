@@ -1,0 +1,153 @@
+name: "[fleet] Promote to release"
+
+# SPLITSING (M5 stap 5, 2026-07-28). Logica byte-identiek uit BiohackOS; alleen het trigger-blok
+# werd `workflow_call`, want triggers horen bij de consument (I1).
+#
+# LET OP — deze workflow draagt ZELF geen production-poort. De required-reviewer-gate zit in de
+# release-workflow van de consument (`[biohack] Release`), die daar blijft. Deze verplaatst alleen
+# een branch; de poort eromheen blijft dus volledig eigendom van de consument.
+#
+# Promoot `main` → `release` en start de gesignde release-build (APK).
+# Dit is de handmatige "release nu / bundel"-knop (workflow_dispatch) én het doel dat
+# auto-merge.yml aanroept nadat een goedgekeurde feature op main is gemergd.
+#
+# Promotie = een MERGE van main in release (net als de handmatige
+# "merge: promoot main → release"-commits), zodat de release-branch zijn versie-bump-
+# lineage (`chore(release): vX [skip ci]`) behoudt en de versie monotoon blijft stijgen.
+# Alles wat sinds de vorige release op main staat, gaat in ÉÉN release mee — zo bundel je
+# meerdere PR's. Zie het interne draaiboek.
+
+on:
+  workflow_call:
+    inputs:
+      reason:
+        type: string
+        required: false
+        default: "handmatige promote"
+        description: "Bundelnotitie (verschijnt in de merge-commit)"
+
+permissions:
+  contents: write
+  actions: write # om release.yml te dispatchen
+
+concurrency:
+  group: promote-release
+  cancel-in-progress: false
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    # Fase 2 van epic #1152: override opgesplitst per spoor (zelfde skip-truc als #1063, nu
+    # per lane) — RUNNER_OVERRIDE_LIGHT pint dit spoor; de ongesplitste RUNNER_OVERRIDE blijft
+    # als globale fallback bestaan naast, niet i.p.v.
+    if: vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == ''
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    with:
+      # Fase 3 van epic #1152: merge + dispatch, geen build → het lichte spoor (2 slots,
+      # mag nooit achter zwaar werk wachten). Fallback blijft ubuntu-latest zolang de
+      # biohack-light-registratie nog niet online is.
+      runner_label: biohack-light
+
+  promote:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 10 # #460: git-merge + dispatch
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge main → release
+        id: merge
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main release
+          git checkout release
+          git reset --hard origin/release
+
+          if git merge-base --is-ancestor origin/main HEAD; then
+            echo "release bevat main al — niets te promoten."
+            echo "promoted=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          merge_msg="merge: promoot main → release (${{ github.event.inputs.reason }})"
+
+          if ! git merge --no-ff origin/main -m "$merge_msg"; then
+            echo "Merge-conflict — probeer het bekende geval te herstellen."
+
+            # Bekend, onschadelijk geval: release.yml bumpt `version:` in pubspec.yaml
+            # alléén op de release-branch (nooit terug naar main), dus main loopt op die
+            # ene regel per ontwerp altijd achter. Conflicteert de merge UITSLUITEND op
+            # die regel, dan wint release's (hogere) versie — release.yml bumpt 'm hierna
+            # toch weer verder. Elk ander conflict blijft hard falen voor handmatige actie.
+            conflicted="$(git diff --name-only --diff-filter=U)"
+            resolved=false
+            # Alleen vertrouwen als pubspec.yaml precies één conflict-hunk heeft — bij
+            # een tweede, ongerelateerde hunk (bv. een los conflicterende dependency-regel)
+            # zou de resolutie hieronder die tweede hunk anders stilzwijgend overschrijven
+            # met de (verkeerde) version-regel van de eerste hunk.
+            marker_count="$(grep -c '^<<<<<<<' pubspec.yaml || true)"
+            if [ "$conflicted" = "pubspec.yaml" ] && [ "$marker_count" = "1" ]; then
+              ours="$(awk '/^<<<<<<</{c=1;next} /^=======/{exit} c' pubspec.yaml)"
+              theirs="$(awk '/^=======/{c=1;next} /^>>>>>>>/{exit} c' pubspec.yaml)"
+              if [ "$(printf '%s' "$ours" | wc -l)" = 0 ] && [ "$(printf '%s' "$theirs" | wc -l)" = 0 ] \
+                 && printf '%s' "$ours" | grep -qE '^version:' \
+                 && printf '%s' "$theirs" | grep -qE '^version:'; then
+                awk -v ours="$ours" '
+                  /^<<<<<<</ {print ours; skip=1; next}
+                  /^=======/ {next}
+                  /^>>>>>>>/ {skip=0; next}
+                  skip {next}
+                  {print}
+                ' pubspec.yaml > pubspec.yaml.new && mv pubspec.yaml.new pubspec.yaml
+                # git add maakt de index-status "resolved" ongeacht de bestandsinhoud, dus
+                # controleer expliciet dat er geen letterlijke conflict-markers overblijven
+                # voordat we dat vertrouwen.
+                if ! grep -qE '^(<<<<<<<|=======|>>>>>>>)' pubspec.yaml; then
+                  git add pubspec.yaml
+                  if [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+                    git commit -m "$merge_msg"
+                    resolved=true
+                  fi
+                fi
+              fi
+            fi
+
+            if [ "$resolved" != true ]; then
+              echo "::error title=Promote::Merge-conflict main → release. Los handmatig op."
+              git merge --abort || true
+              exit 1
+            fi
+            echo "Bekend version-conflict automatisch opgelost — release's versie gehouden."
+          fi
+          git push origin release
+          echo "promoted=true" >> "$GITHUB_OUTPUT"
+
+      - name: Start release-build
+        if: steps.merge.outputs.promoted == 'true'
+        run: |
+          set -euo pipefail
+          # De push hierboven draagt GITHUB_TOKEN en triggert release.yml niet vanzelf,
+          # dus starten we 'm expliciet op de release-branch.
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref release \
+            || echo "::warning::Kon release.yml niet dispatchen — controleer of workflow_dispatch aanstaat."
+
+      - name: Start web-deploy
+        if: steps.merge.outputs.promoted == 'true'
+        run: |
+          set -euo pipefail
+          # Net als de release.yml-dispatch hierboven: een push met GITHUB_TOKEN triggert een
+          # push-workflow niet vanzelf, dus starten we deploy-web.yml expliciet op de
+          # release-branch. Wáár die deploy landt is een zaak van de consument — deFleet weet
+          # daar niets van en hoort dat ook niet te weten. Faalt de dispatch (bijvoorbeeld omdat
+          # de betreffende runner nog niet online is), dan blokkeert dat de release-promotie
+          # bewust NIET.
+          gh workflow run deploy-web.yml --repo "$GITHUB_REPOSITORY" --ref release \
+            || echo "::warning::Kon deploy-web.yml niet dispatchen — controleer of workflow_dispatch aanstaat."

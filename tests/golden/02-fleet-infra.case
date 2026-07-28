@@ -1,0 +1,10 @@
+titel: Runner-lane heavy krijgt een eigen container
+verwacht: transfer KCTHolman/fleet
+---
+## Doel
+De heavy lane draait nog bare-metal onder de gedeelde user, terwijl de agent-lane al
+gecontaineriseerd is. Na deze wijziging draait heavy in een eigen wegwerp-container.
+
+## Acceptatiecriteria
+- [ ] De heavy runner draait onder een eigen OS-user in een container
+- [ ] De gedeelde build-cache blijft warm tussen runs

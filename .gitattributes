@@ -1,0 +1,4 @@
+# Alles LF in de repo. Deze workflows draaien op Linux-runners (self-hosted + ubuntu-latest) en
+# bevatten ingebedde bash; een CRLF die vanaf een Windows-werkstation binnenglipt geeft daar
+# `\r`-fouten die op het werkstation zelf onzichtbaar zijn.
+* text=auto eol=lf

@@ -1,0 +1,80 @@
+name: "[fleet] Checks"
+
+# De CI van de fleet-repo zelf: draait alle shell-testsuites en de contractvalidator.
+#
+# WAAROM DIT BESTAAT. Tot 2026-07-28 had deze repo 41 tests die NIETS automatisch draaide. Wie
+# `routing.yml` aanpaste of aan de doctor sleutelde, kreeg pas bij de eerstvolgende echte run te
+# horen dat er iets stuk was — en de poort is het station dat élk idee raakt. Een testsuite die
+# alleen lokaal draait is een testsuite die de dag na het schrijven al kan roesten.
+#
+# WAAROM ALS `workflow_call` EN NIET DIRECT. Invariant I1: fleet-logica draagt geen eigen trigger.
+# De triggers staan in `checks-caller.yml` — dezelfde splitsing die elke consument krijgt, hier op
+# onszelf toegepast. Dat is meteen de goedkoopste test van dat patroon.
+#
+# Draait op `ubuntu-latest`: deze repo heeft geen eigen runners, en de suites hebben niets nodig
+# behalve bash, awk, sed en python met PyYAML.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        required: false
+        default: ubuntu-latest
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.x"
+
+      - name: PyYAML installeren
+        run: python -m pip install --quiet pyyaml
+
+      - name: Testsuites draaien
+        # Expliciet GEEN `-e` (GitHub's bash-default): ALLE suites moeten draaien, ook als de
+        # eerste faalt. Anders zie je per push maar één probleem tegelijk — dezelfde les als
+        # bij de doctor (gitflow §10 punt 10).
+        shell: bash --noprofile --norc {0}
+        run: |
+          rc=0
+          out() { tee -a "$GITHUB_STEP_SUMMARY"; }
+          printf '# Fleet-checks\n\n' | out
+
+          for suite in scripts/*.test.sh; do
+            [ -f "$suite" ] || continue
+            printf '\n## %s\n\n```\n' "$(basename "$suite")" | out
+            bash "$suite" 2>&1 | out
+            [ "${PIPESTATUS[0]}" -ne 0 ] && rc=1
+            printf '```\n' | out
+          done
+
+          # GOLDEN-RUN apart van de suites: die toetsen of de LOGICA klopt, deze of de
+          # CONFIGURATIE nog de bedoelde uitkomst geeft voor echt werk. Een te breed trefwoord in
+          # routing.yml houdt de suites groen en laat toch de helft van de issues stuiteren.
+          printf '\n## golden-run (bevroren gevallen)\n\n```\n' | out
+          bash scripts/golden-run.sh 2>&1 | out
+          [ "${PIPESTATUS[0]}" -ne 0 ] && rc=1
+          printf '```\n' | out
+
+          printf '\n## fleet-doctor op zichzelf\n\n```\n' | out
+          for m in consistentie contract; do
+            bash scripts/fleet-doctor.sh --module "$m" --root . 2>&1 | out
+            [ "${PIPESTATUS[0]}" -ne 0 ] && rc=1
+          done
+          printf '```\n\n' | out
+
+          if [ "$rc" -ne 0 ]; then
+            printf '❌ **Er zijn falende checks.**\n' | out
+          else
+            printf '✅ **Alles groen.**\n' | out
+          fi
+          exit "$rc"

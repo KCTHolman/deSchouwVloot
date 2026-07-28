@@ -1,0 +1,86 @@
+name: "[fleet] probe"
+
+# Minimale herbruikbare workflow. Bouwt niets, wijzigt niets, checkt niets uit — het enige doel is
+# bewijzen dat de cross-repo-aanroep werkt vóórdat de spine (pick-runner en verder) verhuist.
+#
+# Drie dingen worden hier bewezen, in deze volgorde van "kan misgaan":
+#   1. RESOLVE — een PRIVÉ-repo deelt z'n reusable workflows standaard met niemand. Faalt de
+#      aanroep met "workflow was not found", dan staat Settings → Actions → General → Access nog
+#      niet op "Accessible from repositories owned by the user 'KCTHolman'". Zie README §Eenmalige
+#      repo-instelling — dat is een repo-instelling, dus owner-assist (alleen de eigenaar).
+#   2. CALLER-CONTEXT — `github.repository` hoort de AANROEPER te zijn (KCTHolman/BiohackOS), niet
+#      KCTHolman/fleet. Daar hangt alles aan: pick-runner bevraagt `…/repos/${{ github.repository
+#      }}/actions/runners`, en die API-call moet de runnerpool van de consument zien.
+#   3. RUNNER-RESOLUTIE — `runs-on` met een self-hosted label moet matchen tegen de REPO-SCOPED
+#      runners van de aanroeper. KCTHolman is een persoonlijk account, dus org-level runners
+#      bestaan niet; dit is precies de aanname waar het hele fase-2-plan op rust.
+#
+# Bewust GEEN checkout: `actions/checkout` in een reusable workflow pakt standaard de aanroeper,
+# wat hier niets toevoegt en op een self-hosted runner alleen maar `_work` vervuilt.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        required: false
+        default: ubuntu-latest
+        description: >
+          Runnerlabel om op te draaien. Laat leeg/default voor de veilige eerste run
+          (`ubuntu-latest`, bewijst punt 1 en 2). Zet daarna op `biohack-light` om punt 3 te
+          bewijzen. NIET op `biohack-agent` testen — dat is een 1-slot-lane en deze probe zou
+          'm onnodig bezet houden.
+    outputs:
+      caller:
+        value: ${{ jobs.probe.outputs.caller }}
+        description: De repo die deze workflow aanriep, zoals de job 'm zag.
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5
+    outputs:
+      caller: ${{ steps.report.outputs.caller }}
+    steps:
+      - name: Context rapporteren
+        id: report
+        # Alles naar ZOWEL stdout als de Step Summary — anders is de uitkomst alleen te zien door
+        # de logs te graven. Zelfde patroon als host-diagnostics.yml in BiohackOS.
+        shell: bash --noprofile --norc {0}
+        env:
+          CALLER_REPO: ${{ github.repository }}
+          CALLER_REF: ${{ github.ref }}
+          CALLER_EVENT: ${{ github.event_name }}
+          REQUESTED_RUNNER: ${{ inputs.runner }}
+        run: |
+          set -u
+
+          out() { tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          {
+            printf '# deFleet probe\n\n'
+            printf '| Wat | Waarde | Hoort te zijn |\n'
+            printf '|---|---|---|\n'
+            printf '| Aanroepende repo | `%s` | de consument, NIET KCTHolman/fleet |\n' "$CALLER_REPO"
+            printf '| Ref | `%s` | branch van de consument |\n' "$CALLER_REF"
+            printf '| Event | `%s` | |\n' "$CALLER_EVENT"
+            printf '| Gevraagde runner | `%s` | |\n' "$REQUESTED_RUNNER"
+            # Bewust GEEN `hostname` hier. De probe hoeft alleen te bewijzen dát de aanroep
+            # resolvet en op welke lane 'ie landt; de machinenaam van de host voegt daar niets
+            # aan toe en hoort niet in een build-log dat breder gelezen wordt dan de eigenaar.
+            printf '| Runner-naam | `%s` | |\n' "${RUNNER_NAME:-onbekend}"
+            printf '| Runner-OS/arch | `%s/%s` | |\n' "${RUNNER_OS:-?}" "${RUNNER_ARCH:-?}"
+            printf '\n'
+          } | out
+
+          if [ "$CALLER_REPO" = "KCTHolman/fleet" ]; then
+            printf '⚠️  Caller-context is deFleet zelf — dit was een directe run, geen cross-repo-aanroep.\n' | out
+          else
+            printf '✅ Cross-repo-aanroep gelukt vanuit `%s`.\n' "$CALLER_REPO" | out
+          fi
+
+          echo "caller=${CALLER_REPO}" >> "$GITHUB_OUTPUT"
+          exit 0

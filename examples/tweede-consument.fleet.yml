@@ -1,0 +1,74 @@
+# VOORBEELDCONTRACT voor een TWEEDE consument — een project met een heel andere vorm dan de eerste.
+#
+# WAAROM DIT HET BELANGRIJKSTE VOORBEELD IN DEZE REPO IS. Eén consument bewijst niets: zolang er
+# maar één project op de pijplijn draait, kun je niet zien of de stations projectonafhankelijk zijn
+# of stiekem de vorm van dat ene project hebben aangenomen. Pas een tweede consument met een
+# ándere toolchain, ándere mappenindeling en zónder self-hosted runners laat dat verschil zien.
+#
+# Het scenario hieronder is bewust maximaal anders dan een Flutter-app: Python-services plus een
+# Next.js-frontend, alles op GitHub-hosted runners. Draait de fleet-logica hier zonder ook maar één
+# regel te forken, dan is bewezen dat het contract draagt.
+
+version: 1
+
+# Geen self-hosted runners: alles op GitHub-hosted. Dezelfde vorm als deFleet's eigen contract, en
+# het bewijs dat de lane-abstractie niet afhangt van het bestaan van een self-hosted host.
+lanes:
+  agent: ubuntu-latest
+  heavy: ubuntu-latest
+  light: ubuntu-latest
+  fallback: ubuntu-latest
+
+gates:
+  # Nog geen productie-uitrol en geen mens-poort op features — dit project is in opbouw. Zet
+  # `feature_approval` op `true` zodra er iets draait waar een fout pijn doet.
+  feature_approval: false
+  release_environment: null
+
+budgets:
+  default_model: claude-sonnet-5
+  escalation_model: claude-opus-5
+  max_turns:
+    triage: 30
+    plan: 50
+    build: 80
+    review: 40
+
+# Het gedeelde woordenboek. Een tweede consument moet dezelfde labelnamen voeren als de eerste —
+# dat is precies waarom een transfer vanuit de poort werkt: labels reizen NIET mee bij een
+# `gh issue transfer`, alleen namen die in de doelrepo al bestaan overleven de verhuizing.
+labels:
+  task: claude-task
+  human: needs-human
+  epic: epic
+
+# De enige motor waarvan uitval hier stil zou zijn; de rest van de spine bestaat in dit
+# voorbeeldproject nog niet.
+spine:
+  - pr-check.yml
+
+# GEBIEDEN — de padregels waarmee PR's automatisch een `area:`-label krijgen. Let op hoe anders dit
+# eruitziet dan bij een Flutter-consument: geen `lib/`, geen `*.dart`, geen `android/`, wél
+# Python-services. Exact het verschil dat het contract hoort te dragen zonder dat de fleet-logica
+# er iets van merkt.
+areas:
+  - label: "area: web"
+    paths: '^web/'
+    color: C5DEF5
+    description: Next.js-webfrontend (web/)
+  - label: "area: python"
+    paths: '^services/|^pyproject\.toml$|^requirements\.txt$'
+    color: C5DEF5
+    description: Python-services (services/, pyproject.toml, requirements.txt)
+  - label: "area: supabase"
+    paths: '^supabase/'
+    color: C5DEF5
+    description: Supabase-migraties en -functies
+  - label: "area: ci"
+    paths: '^\.github/|^scripts/|^\.githooks/'
+    color: C5DEF5
+    description: workflows/automatisering
+  - label: "area: docs"
+    paths: '^docs/|(^|/)[^/]*\.md$'
+    color: C5DEF5
+    description: documentatie (docs/, *.md)

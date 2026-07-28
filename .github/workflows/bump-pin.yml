@@ -1,0 +1,182 @@
+name: "[fleet] Bump fleet-pin"
+
+# DE ONTPIN-KNOP (invariant I24, gitflow §13.D). Consumenten staan op een SHA; deze baan schuift die
+# pin vooruit zodra de canary bewezen groen is op een nieuwere fleet-commit.
+#
+# WAAROM DIT BESTAAT. Pinnen zonder automatische bump is geen veiligheid maar verstarring: de
+# consument loopt binnen weken achter en niemand durft nog een grote sprong te maken. Pinnen mét
+# bump geeft het beste van beide — verse logica binnen een dag, maar nooit ongetest.
+#
+# DE CANARY IS deFleet ZELF. Die volgt `@main` en draait bij elke push z'n volledige testsuite
+# (`checks-caller.yml`). Is die groen op de nieuwste commit, dan is de logica één keer echt
+# uitgevoerd vóór een consument 'm overneemt. Is 'ie rood of nog bezig, dan gebeurt er niets — geen
+# bump, geen PR, geen ruis.
+#
+# WAT DEZE BAAN NOOIT DOET: mergen. Hij opent een `chore`-PR en laat die door de normale poorten
+# lopen. Een bump die zichzelf doordrukt zou precies de controle omzeilen die pinnen moest opleveren.
+
+on:
+  workflow_call:
+    inputs:
+      fleet_ref:
+        type: string
+        required: false
+        default: main
+        description: Branch van de fleet-repo waarvan de pin gevolgd wordt (de canary-branch).
+      keep_unpinned:
+        type: string
+        required: false
+        default: bump-pin.yml
+        description: >
+          Bestand dat NIET meegepind wordt. Standaard deze baan zelf: een kapotte pin mag nooit
+          z'n eigen reparatie blokkeren.
+    secrets:
+      APP_ID:
+        required: false
+      APP_PRIVATE_KEY:
+        required: false
+      WORKFLOW_APP_ID:
+        required: false
+      WORKFLOW_APP_PRIVATE_KEY:
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: App-token munten
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID || secrets.WORKFLOW_APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.WORKFLOW_APP_PRIVATE_KEY }}
+          owner: KCTHolman
+
+      - name: Aanroeper uitchecken
+        uses: actions/checkout@v7
+        with:
+          token: ${{ steps.app.outputs.token }}
+
+      - name: Fleet-scripts ophalen
+        uses: actions/checkout@v7
+        with:
+          repository: KCTHolman/fleet
+          ref: ${{ inputs.fleet_ref }}
+          path: .fleet-lib
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Bump bepalen en PR openen
+        shell: bash --noprofile --norc {0}
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          FLEET_REF: ${{ inputs.fleet_ref }}
+          KEEP: ${{ inputs.keep_unpinned }}
+        run: |
+          set -uo pipefail
+          out() { tee -a "$GITHUB_STEP_SUMMARY"; }
+          printf '# Fleet-pin bump — %s\n\n' "$REPO" | out
+
+          # --- FEITEN VERZAMELEN ---------------------------------------------------------------
+          # Deze step verzamelt en voert uit; hij BESLIST niet. De beslissing staat in
+          # scripts/bump-beslis.sh en is daar offline getest — inclusief de canary-poort, de tak
+          # die je bij handmatig uitproberen nooit per ongeluk raakt en die tegelijk het meest
+          # kost als 'ie verkeerd staat: een onterechte bump zet ongeteste fleet-logica bij een
+          # consument neer, precies het risico waarvoor pinnen bestaat.
+          #
+          # De bump-baan zelf staat op @main en telt dus niet mee als "de huidige pin".
+          huidig="$(bash .fleet-lib/scripts/fleet-pin.sh current --root . 2>/dev/null | grep -v "^${FLEET_REF}$" | head -1)"
+          doel="$(gh api "repos/KCTHolman/fleet/commits/${FLEET_REF}" --jq .sha)"
+          canary="$(gh api "repos/KCTHolman/fleet/actions/runs?head_sha=${doel}&status=completed" --jq '[.workflow_runs[] | select(.path | test("checks-caller"))] | first | .conclusion // "onbekend"')"
+          tak="chore/fleet-pin-${doel:0:7}"
+          takbestaat=nee
+          gh api "repos/$REPO/git/ref/heads/$tak" >/dev/null 2>&1 && takbestaat=ja
+
+          printf 'huidige pin: `%s`\n\n' "${huidig:-geen (volgt de branch)}" | out
+          printf 'fleet-doel : `%s`\n\n' "$doel" | out
+          printf 'canary (fleet-CI op die commit): **%s**\n\n' "$canary" | out
+
+          # --- BESLISSEN -------------------------------------------------------------------------
+          besluit="$(bash .fleet-lib/scripts/bump-beslis.sh \
+            --huidig "$huidig" --doel "$doel" --canary "$canary" --tak-bestaat "$takbestaat")"
+          printf 'besluit: **%s**\n\n' "$besluit" | out
+
+          case "$besluit" in
+            niet-gepind)
+              printf 'ℹ️ Deze consument is niet gepind — niets te bumpen.\n' | out; exit 0 ;;
+            actueel)
+              printf '✅ Al op de nieuwste fleet-commit.\n' | out; exit 0 ;;
+            canary-niet-groen)
+              printf '⏸️ Geen bump: de canary is niet groen op die commit. Dat is het systeem dat werkt — de consument blijft op de bewezen pin tot deFleet zelf groen draait.\n' | out; exit 0 ;;
+            tak-bestaat)
+              printf 'ℹ️ Er staat al een bump-tak voor deze commit — niets te doen.\n' | out; exit 0 ;;
+            bump)
+              : ;;
+            *)
+              printf '::error::onbekend besluit "%s" uit bump-beslis.sh\n' "$besluit"; exit 1 ;;
+          esac
+
+          # --- herschrijven + PR --------------------------------------------------------------
+
+          bash .fleet-lib/scripts/fleet-pin.sh rewrite --root . --to "$doel" --keep "$KEEP" | out
+
+          git config user.name "defleet-machinerie[bot]"
+          git config user.email "defleet-machinerie[bot]@users.noreply.github.com"
+          git checkout -b "$tak"
+
+          # SCOPED, NOOIT `git add -A`. Deze baan draait in de werkmap van de CONSUMENT en heeft
+          # daar twee stappen eerder z'n eigen fleet-checkout in `.fleet-lib` gezet. Dat is een
+          # GENESTE GIT-REPO, en `-A` slaat die niet over: git maakt er een gitlink van
+          # (`160000 commit <sha> .fleet-lib`) en commit 'm mee, met een `adding embedded git
+          # repository`-waarschuwing die in de runnerlog wegvalt.
+          #
+          # Geverifieerd op de eerste échte run (2026-07-28, BiohackOS#1734): die PR droeg
+          # `.fleet-lib` mee en bleef rood op de PR-check-poort, want dat pad raakt geen enkele
+          # glob in de area-classifier en valt dus in de fail-closed `other`-bak. De poort deed
+          # het goed; de fout zat hier. Een submodule-verwijzing naar deze PRIVÉrepo op de main
+          # van een consument zou bovendien elke verse checkout breken — nachtelijk opnieuw.
+          #
+          # `fleet-pin.sh rewrite` raakt uitsluitend `<root>/.github/workflows/*.yml`, dus dit is
+          # precies de verzameling die deze commit hoort te bevatten. Wordt de herschrijving ooit
+          # breder, dan hoort dit pad in dezelfde beweging mee te groeien.
+          git add .github/workflows
+
+          # Vangnet bij die laatste zin: staat er tóch iets buiten de workflowmap gestaged, stop
+          # dan luid in plaats van het de consument in te duwen. Een bump hoort saai te zijn.
+          buiten="$(git diff --cached --name-only | grep -v '^\.github/workflows/' || true)"
+          if [ -n "$buiten" ]; then
+            printf '::error::bump wil bestanden buiten .github/workflows/ committen: %s\n' "$(printf '%s' "$buiten" | tr '\n' ' ')"
+            exit 1
+          fi
+
+          # Berichten in een BESTAND opbouwen i.p.v. als meerregelige shell-string: zo'n string
+          # zou met z'n regels op kolom 0 uit de YAML-blokscalar van deze `run:` breken.
+          {
+            printf 'chore(ci): fleet-pin naar %s\n\n' "${doel:0:7}"
+            printf 'De canary (deFleet eigen CI) draaide groen op deze commit, dus de logica is\n'
+            printf 'een keer echt uitgevoerd voordat deze repo hem overneemt.\n\n'
+            printf 'Vorige pin: %s\nNieuwe pin: %s\n\n' "${huidig:0:7}" "${doel:0:7}"
+            printf 'Geopend door de bump-baan (invariant I24). Deze PR merget via de normale\n'
+            printf 'poorten; de baan merget nooit zelf.\n'
+          } > /tmp/bump-msg.txt
+
+          git commit -q -F /tmp/bump-msg.txt
+          git push -q origin "$tak"
+
+          {
+            printf 'Automatische bump van de fleet-pin.\n\n'
+            printf '| | |\n|---|---|\n'
+            printf '| vorige pin | `%s` |\n' "$huidig"
+            printf '| nieuwe pin | `%s` |\n' "$doel"
+            printf '| canary | ✅ groen op deze commit |\n\n'
+            printf 'De canary is deFleet zelf: die volgt `@%s` en draait bij elke push z n volledige testsuite. Groen daar betekent dat de logica een keer echt is uitgevoerd voordat deze repo hem overneemt.\n\n' "$FLEET_REF"
+            printf '`%s` blijft bewust ongepind — een kapotte pin mag nooit z n eigen reparatie blokkeren.\n' "$KEEP"
+          } > /tmp/bump-body.md
+
+          url="$(gh pr create --repo "$REPO" --base "${GITHUB_REF_NAME:-main}" --head "$tak" --title "chore(ci): fleet-pin naar ${doel:0:7}" --body-file /tmp/bump-body.md)"
+          printf '\n📦 PR geopend: %s\n' "$url" | out

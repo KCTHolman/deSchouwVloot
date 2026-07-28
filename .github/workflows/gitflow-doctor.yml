@@ -1,0 +1,395 @@
+name: "[fleet] Gitflow-doctor"
+
+# SPLITSING (M5 stap 3, 2026-07-28). Logica byte-identiek overgenomen uit BiohackOS; alleen het
+# trigger-blok werd `workflow_call`, want triggers horen bij de consument (I1). De caller met de
+# oorspronkelijke triggers staat onder dezelfde bestandsnaam in de consument-repo.
+#
+# ZELFHELENDE GITFLOW. Faalt een van de pijplijn-eigen workflows (de agent-, schedule-,
+# orchestrator- en reconciler-sporen), dan opent dit spoor automatisch één chore-issue dat de
+# RAKET doorloopt: `idee` → triage (Haiku) → plan (Sonnet) → auto-ontsteking → bouw (Opus) →
+# auto-merge → gebundelde release. Zo worden storingen in de pijplijn zélf net zo hardnekkig
+# opgelost als code-bugs, zonder dat de eigenaar ze handmatig hoeft te spotten. Zie
+# het interne draaiboek.
+#
+# WAAROM POLLEN (schedule) i.p.v. `workflow_run`: een `workflow_run`-trigger vereist een expliciete
+# workflow-namenlijst (het `*`-wildcard is niet betrouwbaar gedocumenteerd) en zou bij élke naam-
+# wijziging stil stoppen met dekken. Pollen via de Actions-API is naam-onafhankelijk (het filtert
+# op workflow-PAD), 100% dekkend en volgt de kostenbewuste cadans die project-drive.yml /
+# epic-orchestrator.yml al hanteren. Een storing wordt binnen het interval opgepikt.
+#
+# GEEN Haiku-stap hier: de diagnose laat dit spoor bewust over aan de bestaande Haiku-triage +
+# Sonnet-plan van de raket (die krijgen de faal-log mee) i.p.v. een vierde LLM-call — goedkoper en
+# één bron van oordeel. Dit spoor is puur deterministisch.
+#
+# BEWUST BUITEN SCOPE (die healen elders — dubbel zou ruis/lussen geven), op workflow-PAD:
+#   • pr-check.yml            — PR-CI; healt pr-autofix.yml (tot 3×).
+#   • pr-autofix.yml          — is zelf de PR-CI-healer.
+#   • claude.yml              — trap 3-bouw; een mislukte bouw healt de watchdog (reconcile_stuck_task).
+#   • auto-merge.yml          — idempotente merge, eigen retries.
+#   • pr-conflict-solver.yml  — conflict, eigen retries + escalatie.
+#   • release.yml / promote-release.yml — productie, bewust de eigenaar z'n domein.
+#   • gitflow-doctor.yml      — zichzelf (anti-recursie).
+#
+# LOOP-/SPAM-GUARDS: dedupliceer op een reeds OPEN `gitflow-fix`-issue dat dezelfde workflow noemt;
+# alleen falende runs op de default-branch (`main`) en uit de laatste ~26 uur; max 3 nieuwe chores
+# per sweep. Het issue wordt met de PAT (PROJECT_TOKEN) geopend zodat het `idee`-label de triage
+# daadwerkelijk aftrapt — een GITHUB_TOKEN-issue triggert vanwege GitHub's anti-recursie geen
+# vervolg-workflow (zelfde reden als de re-triage-poort in project-drive.yml).
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gitflow-doctor
+  cancel-in-progress: false
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    # Fase 2 van epic #1152: override opgesplitst per spoor (zelfde skip-truc als #1063, nu
+    # per lane) — RUNNER_OVERRIDE_LIGHT pint dit spoor; de ongesplitste RUNNER_OVERRIDE blijft
+    # als globale fallback bestaan naast, niet i.p.v.
+    if: vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == ''
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    # issue #789 (constitution-amendement 2026-07-11): self-hosted-eerst voor de hele
+    # gitflow-/agent-fleet — ook schedule-/issues-/PR-/workflow_run-context probeert
+    # de self-hosted lane; de ubuntu-latest-fallback blijft intact via pick-runner.yml.
+    with:
+      # Fase 3 van epic #1152: secondenwerk → het lichte spoor (2 slots, mag nooit achter
+      # zwaar werk wachten). Fallback blijft ubuntu-latest zolang de biohack-light-
+      # registratie nog niet online is.
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  diagnose:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 10 # #460: scant gefaalde runs + logstaarten
+    permissions:
+      contents: read
+      issues: write # chore-issues openen (fallback via GITHUB_TOKEN)
+      actions: read # gefaalde workflow-runs + logs lezen
+      pull-requests: read # B1 (c): verweesde epic-fase → gemergede-PR-koppeling + diff-inhoud lezen
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # PAT met scope repo (+ workflows-trigger): een PAT-geopend issue triggert issue-triage wél.
+      PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+      REPO: ${{ github.repository }}
+      # Zelfhelende sporen die elders al genezen — op workflow-PAD (naam-onafhankelijk).
+      EXCLUDE_PATHS: ".github/workflows/pr-check.yml .github/workflows/pr-autofix.yml .github/workflows/claude.yml .github/workflows/auto-merge.yml .github/workflows/pr-conflict-solver.yml .github/workflows/release.yml .github/workflows/promote-release.yml .github/workflows/gitflow-doctor.yml"
+      MAX_CHORES: "3"
+      WINDOW_MIN: "1560" # ~26u: alleen recente storingen; oudere zijn vermoedelijk al opgelost/gemeld
+    steps:
+      # Checkout nodig sinds fase 3 (epic #1168): de B1/B2-guards draaien als scripts uit de repo
+      # (scripts/check-zombie-workflows.sh + scripts/check-fleet-config.sh). De failure-scan
+      # hieronder gebruikt puur `gh api` en heeft de checkout niet nodig, maar hindert er niet van.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: Storingen detecteren en chores openen
+        run: |
+          set -uo pipefail
+
+          if [ -z "${PROJECT_TOKEN:-}" ]; then
+            echo "::warning::PROJECT_TOKEN ontbreekt — een via GITHUB_TOKEN geopend issue triggert de triage niet (anti-recursie). Zet een classic PAT (scope repo+workflow) als repo-secret PROJECT_TOKEN. Zie het interne draaiboek. Ga door met GITHUB_TOKEN als fallback (chore verschijnt, maar moet mogelijk handmatig ge-triaged worden)."
+          fi
+
+          gh label create 'gitflow-fix' --repo "$REPO" --color B60205 \
+            --description 'Auto-chore: een pijplijn-workflow faalde (gitflow-doctor)' 2>/dev/null || true
+          gh label create 'idee' --repo "$REPO" --color EDEDED \
+            --description 'Ruw issue — raket trap 1 (triage)' 2>/dev/null || true
+
+          now="$(date -u +%s)"
+          window_epoch=$(( now - WINDOW_MIN * 60 ))
+
+          # Recent gefaalde runs op main. De REST-run bevat `path` (workflow-bestand) → naam-
+          # onafhankelijk excluden. status=failure dekt conclusion=failure; timed_out/startup nemen
+          # we mee via een tweede pas is overbodig — failure is de dominante klasse.
+          runs="$(gh api "repos/$REPO/actions/runs?status=failure&branch=main&per_page=50" \
+            --jq '.workflow_runs[] | [(.id|tostring), .name, .path, .event, .created_at, .html_url] | @tsv' \
+            2>/dev/null || true)"
+          if [ -z "$runs" ]; then
+            echo "Geen recent gefaalde runs op main."; exit 0
+          fi
+
+          # Reeds gemelde workflows (open issues met gitflow-fix) — dedup op titel-substring.
+          open_titles="$(gh issue list --repo "$REPO" --state open --label gitflow-fix \
+            --json title --jq '.[].title' 2>/dev/null || true)"
+
+          opened=0
+          seen_paths=""
+          while IFS=$'\t' read -r rid rname rpath revent rcreated rurl; do
+            [ -n "${rpath:-}" ] || continue
+
+            # Buiten scope? (zelfhelende sporen)
+            case " $EXCLUDE_PATHS " in *" $rpath "*) continue ;; esac
+
+            # Alleen recente storingen.
+            cepoch="$(date -u -d "$rcreated" +%s 2>/dev/null || echo 0)"
+            [ "$cepoch" -ge "$window_epoch" ] || continue
+
+            # Eén chore per distinct workflow-pad per sweep.
+            case " $seen_paths " in *" $rpath "*) continue ;; esac
+
+            # Dedup tegen een al-open gitflow-fix-issue voor deze workflow (naam in de titel).
+            if printf '%s\n' "$open_titles" | grep -qiF -- "$rname"; then
+              echo "Workflow '$rname' heeft al een open gitflow-fix-issue — overslaan."
+              seen_paths="$seen_paths $rpath"
+              continue
+            fi
+
+            # ALREADY-HEALED-GUARD (2026-07-22, issues #1492/#1493): het 26u-venster kijkt naar
+            # gefaalde runs, niet naar of de storing nog reëel is. Zodra de vorige tracking-issue
+            # voor een workflow sluit, vond de eerstvolgende sweep tot nu toe gewoon dezelfde oude
+            # gefaalde run terug en opende een NIEUW issue — ook als een latere run allang was
+            # gefixt en slaagde. Check daarom: is de meest recente run van déze workflow op main
+            # (any-status, sorteert nieuwste-eerst) een ANDERE run dan de gefaalde, en geslaagd?
+            # Dan is de storing vermoedelijk al gefixt — geen chore, alleen loggen.
+            latest="$(gh api "repos/$REPO/actions/workflows/${rpath##*/}/runs?branch=main&per_page=1" \
+              --jq '.workflow_runs[0] | [(.id|tostring), (.conclusion // "")] | @tsv' 2>/dev/null || true)"
+            if [ -n "$latest" ]; then
+              latest_id="${latest%%$'\t'*}"
+              latest_conclusion="${latest#*$'\t'}"
+              if [ "$latest_id" != "$rid" ] && [ "$latest_conclusion" = "success" ]; then
+                echo "Storing '$rname' ($rpath, run $rid) lijkt al gefixt — latere run $latest_id op main slaagde. Overslaan."
+                seen_paths="$seen_paths $rpath"
+                continue
+              fi
+            fi
+
+            # Faal-log-staart als context voor de raket-triage/-plan (best-effort, ingekort).
+            # 20000 i.p.v. eerder 3500: bij 3500 werd de staart volledig opgesoupeerd door de
+            # onschuldige actions/checkout-cleanup-boilerplate (git config --unset ...) die altijd
+            # als laatste in de job-log staat, waardoor de échte fout er nooit in paste (#500).
+            # Zelfde limiet als pr-autofix.yml. Vervroegd (was ná de MAX_CHORES-check) zodat de
+            # transient-infra-guard hieronder 'm kan inspecteren vóórdat een chore geopend wordt.
+            logtail="$(gh run view "$rid" --repo "$REPO" --log-failed 2>/dev/null | tail -c 20000 || true)"
+            [ -n "$logtail" ] || logtail="(geen faal-log beschikbaar via gh run view --log-failed)"
+
+            # HOST-WORK-OWNERSHIP-CORRUPTIE-GUARD (2026-07-19, melding "bijna alle PR's falen"): de
+            # self-hosted `biohack-agent`-runner (1 slot, gedeeld door alle 11
+            # claude-code-action-workflows) kan stale root-owned bestanden krijgen ergens onder
+            # `_work/` — waargenomen zowel als `_work/_actions/anthropics/claude-code-action/...`
+            # (onleesbaar tijdens "Set up job") als `_work/_temp/claude-prompts` (EACCES in
+            # claude-code-action's eigen opruimcode, ná de setup-fase). Twee losse foutvormen, zelfde
+            # onderliggende storingsklasse. Dit is GEEN code-bug: geen `chore(ci):`-PR kan
+            # bestandsrechten op de eigenaar z'n host herstellen. Erger: de bouwstap die zo'n PR zou moeten
+            # maken gebruikt zélf claude-code-action op dezelfde kapotte runner (kip-en-ei) — de
+            # normale `idee`-RAKET loopt hier onherroepelijk vast. Anders dan de
+            # TRANSIENT-INFRA-GUARD hieronder (GitHub-eigen blips die vanzelf overgaan) mag dit NIET
+            # stilzwijgend geskipt worden: het lost zichzelf niet op. Dedup op de storing zelf (niet
+            # per workflow-naam), want dit patroon raakt typisch meerdere van de 11 workflows tegelijk
+            # in dezelfde sweep. Volledig draaiboek: het interne draaiboek.
+            if printf '%s' "$logtail" | grep -qiE "(Access to the path '[^']*_work/[^']*' is denied|EACCES: permission denied.*_work/)"; then
+              marker="runner _work-ownership-corruptie (biohack-agent)"
+              if printf '%s\n' "$open_titles" | grep -qiF -- "$marker"; then
+                echo "Host-_work-corruptie al gemeld (open needs-human-issue) — '$rname' overslaan."
+              else
+                gh label create 'needs-human' --repo "$REPO" --color 5319E7 \
+                  --description 'Vereist host-/repo-instellingen-toegang die een agent niet heeft' 2>/dev/null || true
+                nh_title="chore(ci): $marker — self-heal-loop kan dit niet oplossen"
+                nh_body="$(printf '%s\n' \
+                  "\`gitflow-doctor\` detecteerde host-\`_work\`-ownership-corruptie op de self-hosted" \
+                  "\`biohack-agent\`-runner: run **$rname** (\`$rpath\`, $rurl) faalde met een" \
+                  "\"Access to the path ... is denied\" of \`EACCES: permission denied\` op een pad onder" \
+                  "\`_work/\`. Dit raakt typisch meerdere van de 11 claude-code-action-workflows" \
+                  "tegelijk, omdat ze allemaal op dezelfde ene runner landen." \
+                  "" \
+                  "Dit is GEEN code-bug: de fout ontstaat tijdens de \"Set up job\"-fase van de runner zelf," \
+                  "vóór enige workflow-stap draait. Geen \`chore(ci):\`-PR kan bestandsrechten op de host" \
+                  "herstellen, en de bouwstap die zo'n PR zou maken gebruikt zélf claude-code-action op" \
+                  "dezelfde kapotte runner (kip-en-ei) — vandaar direct \`needs-human\` i.p.v. de normale" \
+                  "\`idee\`-RAKET." \
+                  "" \
+                  "**Draaiboek (owner-assist):** \`het interne draaiboek\`." \
+                  "" \
+                  "## Faal-log (staart, ingekort)" \
+                  '```' \
+                  "$logtail" \
+                  '```' \
+                  "" \
+                  "<sub>Automatisch geopend door gitflow-doctor. Dedup-marker: \`$marker\`. Sluit dit issue" \
+                  "zodra het draaiboek is uitgevoerd en de runs weer slagen.</sub>")"
+                if [ -n "${PROJECT_TOKEN:-}" ]; then
+                  GH_TOKEN="$PROJECT_TOKEN" gh issue create --repo "$REPO" \
+                    --title "$nh_title" --body "$nh_body" --label needs-human --label gitflow-fix \
+                    || echo "::warning::Kon needs-human-issue niet openen (PAT) voor host-_work-corruptie."
+                else
+                  gh issue create --repo "$REPO" \
+                    --title "$nh_title" --body "$nh_body" --label needs-human --label gitflow-fix \
+                    || echo "::warning::Kon needs-human-issue niet openen (GITHUB_TOKEN) voor host-_work-corruptie."
+                fi
+                open_titles="$(printf '%s\n%s' "$open_titles" "$nh_title")"
+              fi
+              seen_paths="$seen_paths $rpath"
+              continue
+            fi
+
+            # TRANSIENT-INFRA-GUARD (gitflow-audit 2026-07-13, issue #929): een storing als
+            # "Failed to resolve action download info" / "Service Unavailable" komt van GitHubs eigen
+            # Actions-infrastructuur (action-download-endpoint), niet van onze code — er ís geen
+            # `chore(ci):`-fix voor. Zo'n chore eindigt onvermijdelijk in `needs-human` (de raket kan
+            # geen bug diagnosticeren die niet bestaat), wat alleen ruis toevoegt. Skip 'm hier; is de
+            # storing persistent (geen infra-blip maar een echt patroon), dan faalt de run ook zonder
+            # deze regel opnieuw en pikt de eerstvolgende sweep 'm alsnog op zodra de logtail wél een
+            # echte oorzaak bevat.
+            if printf '%s' "$logtail" | grep -qiE 'Service Unavailable|Failed to resolve action download info|Failed to download action|ETIMEDOUT|getaddrinfo ENOTFOUND'; then
+              echo "Storing '$rname' ($rpath) is een GitHub-infra-blip (geen code-oorzaak) — geen chore, overslaan."
+              seen_paths="$seen_paths $rpath"
+              continue
+            fi
+
+            if [ "$opened" -ge "$MAX_CHORES" ]; then
+              echo "::notice::Cap van $MAX_CHORES chores per sweep bereikt — resterende storingen volgende sweep."
+              break
+            fi
+
+            echo "Storing: '$rname' ($rpath), run $rid — chore openen."
+            seen_paths="$seen_paths $rpath"
+
+            # Body met printf (géén heredoc: een col-0 heredoc breekt de YAML-block-scalar).
+            # Backticks in dubbele quotes escapen (\`) → literaal; de ```-fences enkel-gequote.
+            title="chore(ci): \`$rname\` faalt in de pijplijn"
+            body="$(printf '%s\n' \
+              "De workflow **$rname** (\`$rpath\`) faalde — automatisch gedetecteerd door \`gitflow-doctor\`." \
+              "" \
+              "- **Gefaalde run:** $rurl" \
+              "- **Trigger-event:** $revent" \
+              "- **Aangemaakt:** $rcreated" \
+              "" \
+              "## Opdracht (fix)" \
+              "Onderzoek waarom deze workflow faalt en herstel 'm met een minimale \`chore(ci):\`-wijziging." \
+              "Raak alleen \`$rpath\` (en strikt noodzakelijke helpers) aan. Verifieer de YAML-syntax; als" \
+              "er een script bij hoort, draai \`bash -n\` erover." \
+              "" \
+              "## Faal-log (staart, ingekort)" \
+              '```' \
+              "$logtail" \
+              '```' \
+              "" \
+              "<sub>Automatisch geopend door gitflow-doctor. Dedup-marker: \`gitflow-fix\`. Sluit dit issue als de storing niet (meer) reëel is.</sub>")"
+
+            # Openen met de PAT zodat `idee` de triage aftrapt; anders GITHUB_TOKEN als fallback.
+            if [ -n "${PROJECT_TOKEN:-}" ]; then
+              GH_TOKEN="$PROJECT_TOKEN" gh issue create --repo "$REPO" \
+                --title "$title" --body "$body" --label idee --label gitflow-fix \
+                && opened=$(( opened + 1 )) \
+                || echo "::warning::Kon chore-issue niet openen (PAT) voor '$rname'."
+            else
+              gh issue create --repo "$REPO" \
+                --title "$title" --body "$body" --label idee --label gitflow-fix \
+                && opened=$(( opened + 1 )) \
+                || echo "::warning::Kon chore-issue niet openen (GITHUB_TOKEN) voor '$rname'."
+            fi
+          done <<< "$runs"
+
+          echo "Klaar — $opened nieuwe chore(s) geopend."
+
+      # ── B1 + B2 self-heal-guards (epic #1168 fase 3) ────────────────────────────────────────
+      # Naast de failure-scan hierboven draaien twee stille-storingsklassen-guards mee in dezelfde
+      # 2×/dag-sweep. Ze detecteren wat de failure-scan mist:
+      #   • B1 (check-zombie-workflows.sh): "success"-runs met geskipte hoofd-jobs, stilgevallen
+      #     schedules, en als "completed" gesloten epic-fasen zonder echte gemergede diff.
+      #   • B2 (check-fleet-config.sh): naar niet-bestaande secrets/vars verwijzende workflows +
+      #     `allowed_bots`-drift over de fleet.
+      # Elke guard opent hoogstens ÉÉN gededupte `gitflow-fix`-chore per sweep (zelfde dedup-marker-
+      # /idee-/PAT-patroon als de failure-scan) — geen storm, ook al vlagt 'ie meerdere afwijkingen.
+      - name: B1/B2-guards draaien en gededupte chores openen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PROJECT_TOKEN: ${{ secrets.PROJECT_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          # BEWUST `+e` (2026-07-18). GitHub draait `run:`-blokken als `bash -e {0}`, en `set -uo
+          # pipefail` zet dat NIET uit. De twee guards hieronder signaleren hun bevindingen via een
+          # exit-code (0=schoon, 1=bevinding, 2=toolfout) die daarna in een `case` een chore-issue
+          # opent. Met `-e` actief brak `zb_out="$(...)"; zb_rc=$?` de stap echter af op precies het
+          # moment dat er iets te melden viel: de `case` werd nooit bereikt, er kwam geen chore, en
+          # B2 (config-drift) draaide helemaal niet meer. De foutafhandeling was dus dood zodra ze
+          # nodig was — zichtbaar vanaf 2026-07-17 20:30, toen B1 zombies begon te vinden en drie
+          # opeenvolgende doctor-runs op rij faalden zonder één chore te openen.
+          set +e
+
+          gh label create 'gitflow-fix' --repo "$REPO" --color B60205 \
+            --description 'Auto-chore: een pijplijn-workflow faalde (gitflow-doctor)' 2>/dev/null || true
+          gh label create 'idee' --repo "$REPO" --color EDEDED \
+            --description 'Ruw issue — raket trap 1 (triage)' 2>/dev/null || true
+
+          # Reeds gemelde guard-bevindingen (open gitflow-fix-issues) — dedup op titel-substring.
+          open_titles="$(gh issue list --repo "$REPO" --state open --label gitflow-fix \
+            --json title --jq '.[].title' 2>/dev/null || true)"
+
+          # Open één gededupte gitflow-fix-chore voor een guard-bevinding.
+          # $1=dedup-marker (titel-substring), $2=titel, $3=bevindingen-tekst, $4=guard-script-pad.
+          open_guard_issue() {
+            local marker="$1" title="$2" findings="$3" script="$4"
+            if printf '%s\n' "$open_titles" | grep -qiF -- "$marker"; then
+              echo "Guard-bevinding '$marker' heeft al een open gitflow-fix-issue — overslaan."
+              return 0
+            fi
+            local body
+            body="$(printf '%s\n' \
+              "Automatisch gedetecteerd door \`gitflow-doctor\` (self-heal-guard, epic #1168)." \
+              "" \
+              "## Bevindingen" \
+              '```' \
+              "$findings" \
+              '```' \
+              "" \
+              "## Opdracht (fix)" \
+              "Onderzoek en verhelp de bovenstaande afwijking(en) met een minimale \`chore(ci):\`-wijziging." \
+              "Bevestig daarna dat de guard schoon draait (\`bash $script\`)." \
+              "" \
+              "<sub>Automatisch geopend door gitflow-doctor. Dedup-marker: \`$marker\`. Sluit dit issue als de afwijking niet (meer) reëel is.</sub>")"
+            if [ -n "${PROJECT_TOKEN:-}" ]; then
+              GH_TOKEN="$PROJECT_TOKEN" gh issue create --repo "$REPO" \
+                --title "$title" --body "$body" --label idee --label gitflow-fix \
+                && echo "Chore geopend: $title" || echo "::warning::Kon guard-chore niet openen (PAT): $title"
+            else
+              gh issue create --repo "$REPO" \
+                --title "$title" --body "$body" --label idee --label gitflow-fix \
+                && echo "Chore geopend: $title" || echo "::warning::Kon guard-chore niet openen (GITHUB_TOKEN): $title"
+            fi
+          }
+
+          # Guards draaien met GITHUB_ACTIONS leeg: dan onderdrukken ze hun eigen `::error::`-
+          # annotaties (we zetten de bevindingen om in één issue i.p.v. rode annotaties op déze run).
+          # Exit-code-contract van de check-*.sh-guards: 0 = schoon, 1 = ≥1 afwijking, 2 = tool-/
+          # configuratiefout (dan géén chore — dat is een infra-/permissieprobleem, geen code-bug).
+
+          echo "── B1 — zombie-detectie ────────────────────────────────────────────"
+          zb_out="$(GITHUB_ACTIONS= bash scripts/check-zombie-workflows.sh 2>&1)"; zb_rc=$?
+          printf '%s\n' "$zb_out"
+          case "$zb_rc" in
+            0) echo "B1 schoon — geen zombies." ;;
+            1) open_guard_issue "zombie-workflow(s) gedetecteerd" \
+                 "chore(ci): zombie-workflow(s) gedetecteerd door gitflow-doctor" \
+                 "$zb_out" "scripts/check-zombie-workflows.sh" ;;
+            *) echo "::warning::check-zombie-workflows.sh gaf exit $zb_rc (tool-/configuratiefout) — geen chore geopend." ;;
+          esac
+
+          echo "── B2 — config-drift ───────────────────────────────────────────────"
+          # B2 leest secret/var-NAMEN (nooit waarden) via `gh secret/variable list` — dat vereist de
+          # PAT (de GITHUB_TOKEN mag geen repo-config-namen lezen). Zonder PAT: overslaan (geen chore).
+          if [ -n "${PROJECT_TOKEN:-}" ]; then
+            fc_out="$(GITHUB_ACTIONS= GH_TOKEN="$PROJECT_TOKEN" bash scripts/check-fleet-config.sh 2>&1)"; fc_rc=$?
+            printf '%s\n' "$fc_out"
+            case "$fc_rc" in
+              0) echo "B2 schoon — geen config-drift." ;;
+              1) open_guard_issue "fleet-config-drift gedetecteerd" \
+                   "chore(ci): fleet-config-drift gedetecteerd door gitflow-doctor" \
+                   "$fc_out" "scripts/check-fleet-config.sh" ;;
+              *) echo "::warning::check-fleet-config.sh gaf exit $fc_rc (tool-/configuratiefout) — geen chore geopend." ;;
+            esac
+          else
+            echo "::warning::PROJECT_TOKEN ontbreekt — B2 (config-drift) overgeslagen (kan secret/var-namen niet lezen zonder PAT)."
+          fi
+
+          echo "Klaar — B1/B2-guards afgerond."

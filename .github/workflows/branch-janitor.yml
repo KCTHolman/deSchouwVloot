@@ -1,0 +1,139 @@
+name: "[fleet] Branch janitor"
+
+# SPLITSING (M5 stap 3, 2026-07-28). Logica byte-identiek overgenomen uit BiohackOS; alleen het
+# trigger-blok werd `workflow_call`, want triggers horen bij de consument (I1). De caller met de
+# oorspronkelijke triggers staat onder dezelfde bestandsnaam in de consument-repo.
+# De `branches`-dispatch-input is meeverhuisd als `workflow_call`-input; de caller geeft 'm door.
+#
+# Vangnet naast "Cleanup merged branch": die ruimt alleen de head-branch van de PR op die
+# zelf gemerged werd. Branches die *indirect* landen — gebundeld in een andere PR
+# (bv. issue-20/-21 via een verzamel-PR) of vervangen door een latere poging op
+# hetzelfde issue — krijgen nooit hun eigen "closed: merged"-event en blijven anders
+# voor altijd staan. Draait wekelijks en ruimt elke niet-beschermde branch op waarvan
+# de PR gemerged is en die geen open PR (meer) heeft.
+#
+# LET OP (issue: 84 stale branches gevonden, 2026-07-26) — GEEN `git merge-base --is-ancestor`-
+# check meer: deze repo squash-merget (merge-commits heten "... (#1646)"), waardoor de branch-tip
+# NOOIT ancestor van main wordt — de oude ancestor-check vond dus structureel 0 kandidaten en
+# liet gemergede branches voor altijd staan. Vraagt in plaats daarvan de PR-API (`gh pr list
+# --state merged --head`) of er een gemergede PR voor de branch bestaat — dat klopt ongeacht
+# het merge-type (merge/squash/rebase).
+
+on:
+  workflow_call:
+    inputs:
+      branches:
+        type: string
+        required: false
+        description: >
+          Optioneel: expliciete lijst branchnamen (één per regel) om te verwijderen, ongeacht
+          gemergede-PR-status. Voor een mens-gecureerde bulk-opruiming — de auto-sweep vereist
+          ALTIJD de merged-PR-check. Leeg = normale auto-sweep.
+
+permissions:
+  contents: read
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    # Fase 2 van epic #1152: override opgesplitst per spoor (zelfde skip-truc als #1063, nu
+    # per lane) — RUNNER_OVERRIDE_LIGHT pint dit spoor; de ongesplitste RUNNER_OVERRIDE blijft
+    # als globale fallback bestaan naast, niet i.p.v.
+    if: vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == ''
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    # issue #789 (constitution-amendement 2026-07-11): self-hosted-eerst voor de hele
+    # gitflow-/agent-fleet — ook schedule-/issues-/PR-/workflow_run-context probeert
+    # de self-hosted lane; de ubuntu-latest-fallback blijft intact via pick-runner.yml.
+    with:
+      # Fase 3 van epic #1152: secondenwerk → het lichte spoor (2 slots, mag nooit achter
+      # zwaar werk wachten). Fallback blijft ubuntu-latest zolang de biohack-light-
+      # registratie nog niet online is.
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  sweep:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 10 # #460: loopt remote branches af
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verwijder gemergede branches zonder open PR
+        if: github.event.inputs.branches == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin --prune
+
+          open_heads="$(gh pr list --state open --json headRefName -q '.[].headRefName')"
+
+          git for-each-ref --format='%(refname:short)' 'refs/remotes/origin' | sed 's#^origin/##' | while read -r br; do
+            case "$br" in
+              ""|HEAD|main|acc|release|lab) continue ;;
+            esac
+
+            if printf '%s\n' "$open_heads" | grep -qxF "$br"; then
+              echo "Skip '$br' — heeft nog een open PR."
+              continue
+            fi
+
+            merged_count="$(gh pr list --state merged --head "$br" --json number --jq 'length')"
+            if [ "$merged_count" -gt 0 ]; then
+              echo "Opruimen: '$br' heeft een gemergede PR en geen open PR."
+              gh api -X DELETE "repos/${REPO}/git/refs/heads/${br}" \
+                && echo "Verwijderd." \
+                || echo "Kon '$br' niet verwijderen (al weg?)."
+            fi
+          done
+
+      # Mens-gecureerde bulk-opruiming (bv. na een branch-audit): verwijdert exact de opgegeven
+      # lijst, ZONDER de merged-PR-eis — een mens heeft de inhoud al individueel geverifieerd
+      # (audit tegen main-content + PR-/issue-geschiedenis). Beschermde branches en branches met
+      # een nog-open PR worden ook hier altijd overgeslagen (live check, niet vertrouwen op de
+      # meegegeven lijst).
+      - name: Verwijder expliciet opgegeven branches (mens-gecureerd)
+        if: github.event.inputs.branches != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BRANCHES: ${{ github.event.inputs.branches }}
+        run: |
+          set -euo pipefail
+
+          git fetch origin --prune
+
+          open_heads="$(gh pr list --state open --json headRefName -q '.[].headRefName')"
+
+          printf '%s\n' "$BRANCHES" | while IFS= read -r br; do
+            br="$(printf '%s' "$br" | xargs)" # trim
+            [ -z "$br" ] && continue
+            case "$br" in
+              HEAD|main|acc|release|lab)
+                echo "Beschermde branch '$br' — niet verwijderen."; continue ;;
+            esac
+
+            if ! git rev-parse --verify -q "origin/$br" >/dev/null; then
+              echo "Branch '$br' bestaat niet (meer) — niets te doen."
+              continue
+            fi
+
+            if printf '%s\n' "$open_heads" | grep -qxF "$br"; then
+              echo "Skip '$br' — heeft nog een open PR."
+              continue
+            fi
+
+            echo "Opruimen (mens-gecureerd): '$br'."
+            gh api -X DELETE "repos/${REPO}/git/refs/heads/${br}" \
+              && echo "Verwijderd." \
+              || echo "Kon '$br' niet verwijderen (al weg?)."
+          done

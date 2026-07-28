@@ -1,0 +1,218 @@
+name: "[fleet] Intake (de poort)"
+
+# DE VOORDEUR van alle projecten (docs/architectuur.md §3b). Elk idee/issue/epic komt hier binnen,
+# ongeacht voor welk project het is; deze workflow bepaalt het doelproject en verplaatst het issue
+# er NATIEF heen (`gh issue transfer` — nooit kopiëren, dus geen dubbele waarheid; GitHub's
+# redirect houdt de historie en het oude nummer intact).
+#
+# WAT DEZE WORKFLOW BEWUST NIET DOET: plannen. Een plan zonder constitution/spec/codebase van het
+# doelproject is per definitie oppervlakkig ("plaats vroeg, werk uit in context"). De poort
+# routeert; trap 2 in het doelproject werkt uit.
+#
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+# SHOWCASE-VARIANT — DRIE BEWUSTE AFWIJKINGEN VAN DE PRODUCTIEVERSIE
+#
+# In productie draait deze workflow op `on: issues` in een PRIVÉ repo. Dat is daar verdedigbaar,
+# want alleen de eigenaar kan een issue openen. In een PUBLIEKE repo verandert diezelfde trigger
+# in een anonieme voordeur: iedere GitHub-gebruiker zou 'm kunnen aftrappen. Vandaar:
+#
+#   1. TRIGGER → `workflow_call`. Deze repo bevat geen enkele workflow die uit zichzelf vuurt.
+#      Een reusable workflow start alleen als een andere workflow 'm expliciet aanroept; roept
+#      een vreemde 'm cross-repo aan, dan draait dat op ZIJN runners met ZIJN secrets — nooit op
+#      die van de eigenaar van deze repo. `scripts/check-no-triggers.sh` bewaakt dit machinaal.
+#
+#   2. APP-TOKEN GESCOPED. De productieversie mint een token op `owner:` zónder `repositories:`,
+#      oftewel schrijfrechten op ÁLLE repo's van de installatie. Achter een anonieme trigger is
+#      dat een onaanvaardbare blast radius. Hier staat de scope expliciet op de repo's die de
+#      transfer daadwerkelijk nodig heeft.
+#
+#   3. DEDUPE VERWIJDERD. De productieversie zocht met `gh search issues` naar mogelijke
+#      duplicaten in de DOELrepo en plakte de gevonden titels in een comment. Staat de doelrepo
+#      op privé en deze op publiek, dan lekken die titels — de notificatiemail naar de indiener
+#      is al verstuurd voordat de transfer het issue wegtrekt. Dedupe hoort thuis in trap 1 van
+#      het doelproject, waar de domeinkennis zit; daar is 'ie ook nuttiger.
+# ────────────────────────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_call:
+    inputs:
+      issue_number:
+        type: string
+        required: true
+      issue_title:
+        type: string
+        required: true
+      issue_body:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read   # routing.yml + het beslisscript uitchecken
+  issues: write    # labelen + de ene comment bijwerken (transfer loopt via de app-token)
+
+concurrency:
+  # Per subject (I6/I18): een snelle bewerking na een bounce mag de vorige run inhalen, maar twee
+  # runs mogen nooit tegelijk hetzelfde issue labelen/transferen.
+  group: intake-${{ inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  poort:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: App-token munten
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # EXPLICIETE SCOPE (showcase-afwijking, zie de kop). `owner` zonder `repositories` levert
+          # een token met schrijfrechten op ALLE repo's van de installatie. Een transfer heeft
+          # alleen deze repo + de doelrepo's nodig, dus staat de lijst hier voluit. Least-privilege
+          # is hier geen formaliteit: dit token is het enige dat buiten deze repo kan schrijven.
+          repositories: |
+            fleet
+            BiohackOS
+
+      - name: Beslissen
+        id: beslis
+        env:
+          # Onvertrouwde tekst gaat ALTIJD via `env`, nooit als `${{ }}` in het script zelf:
+          # anders wordt een issue-titel met backticks of `$(...)` gewoon uitgevoerd op de runner.
+          TITLE: ${{ inputs.issue_title }}
+          BODY: ${{ inputs.issue_body }}
+        run: |
+          set -euo pipefail
+          printf '%s' "${BODY:-}" > /tmp/body.md
+          # Beslislogica staat los in scripts/intake-decide.sh (offline getest door
+          # intake-decide.test.sh) — deze workflow blijft dom en voert alleen uit.
+          bash scripts/intake-decide.sh --title "$TITLE" --body-file /tmp/body.md \
+            --routing routing.yml > /tmp/decision.txt
+          cat /tmp/decision.txt
+          sed -n 's/^decision=/decision=/p' /tmp/decision.txt >> "$GITHUB_OUTPUT"
+          sed -n 's/^target=/target=/p'     /tmp/decision.txt >> "$GITHUB_OUTPUT"
+          # `reason` kan leestekens bevatten → via een heredoc-delimiter i.p.v. een kale regel.
+          {
+            echo 'reason<<EOF_REASON'
+            sed -n 's/^reason=//p' /tmp/decision.txt
+            echo 'EOF_REASON'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Uitvoeren
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          NUM: ${{ inputs.issue_number }}
+          TITLE: ${{ inputs.issue_title }}
+          DECISION: ${{ steps.beslis.outputs.decision }}
+          TARGET: ${{ steps.beslis.outputs.target }}
+          REASON: ${{ steps.beslis.outputs.reason }}
+        run: |
+          set -euo pipefail
+
+          MARKER='<!-- fleet-intake -->'
+
+          # IDEMPOTENT COMMENTEREN. De poort draait opnieuw bij elke bewerking (dat is de
+          # bounce-lus), dus een nieuwe comment per run zou een issue volspammen. We houden er
+          # exact één bij, herkenbaar aan de marker, en werken die bij.
+          comment() {
+            local body="$1" id
+            id="$(gh api "repos/$REPO/issues/$NUM/comments" --paginate \
+                   --jq "[.[] | select(.body | contains(\"$MARKER\"))] | first | .id // empty")"
+            if [ -n "$id" ]; then
+              gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" >/dev/null
+              echo "comment bijgewerkt ($id)"
+            else
+              gh api -X POST "repos/$REPO/issues/$NUM/comments" -f body="$body" >/dev/null
+              echo "comment geplaatst"
+            fi
+          }
+
+          # Labels wisselen zonder te stapelen: precies één poort-status tegelijk.
+          set_status_label() {
+            local keep="${1:-}"
+            for l in needs-detail needs-routing; do
+              if [ "$l" = "$keep" ]; then
+                gh issue edit "$NUM" --repo "$REPO" --add-label "$l" >/dev/null
+              else
+                gh issue edit "$NUM" --repo "$REPO" --remove-label "$l" >/dev/null 2>&1 || true
+              fi
+            done
+          }
+
+          # Berichten worden met printf-argumenten opgebouwd, niet als meerregelige string: een
+          # tekstregel op kolom 1 breekt uit de YAML-blokscalar van deze `run:`.
+          case "$DECISION" in
+            detail)
+              set_status_label needs-detail
+              comment "$(printf '%s\n' \
+                "$MARKER" \
+                "🚧 **De poort houdt dit even tegen.**" \
+                "" \
+                "$REASON" \
+                "" \
+                "Werk het issue bij — bewerken volstaat, ik kijk vanzelf opnieuw. Daarna gaat 'ie door naar het juiste project.")"
+              ;;
+
+            routing)
+              set_status_label needs-routing
+              comment "$(printf '%s\n' \
+                "$MARKER" \
+                "🧭 **Ik weet niet zeker bij welk project dit hoort.**" \
+                "" \
+                "$REASON" \
+                "" \
+                "Zeg waar 'ie heen moet, dan verplaats ik 'm — of vul \`routing.yml\` aan als dit onderwerp vaker langskomt.")"
+              ;;
+
+            transfer)
+              set_status_label ""
+
+              # ZELF-ROUTERING. Fleet-infra-werk hoort in deFleet (architectuur §3b: deFleet is
+              # z'n eigen eerste extra consument). Een `gh issue transfer` naar de eigen repo
+              # faalt hard, dus dat pad eindigt hier: het issue blijft gewoon staan.
+              if [ "$TARGET" = "$REPO" ]; then
+                comment "$(printf '%s\n' \
+                  "$MARKER" \
+                  "🏠 **Dit is fleet-infrawerk — blijft hier staan.**" \
+                  "" \
+                  "$REASON" \
+                  "" \
+                  "Geen transfer nodig: deFleet is voor dit onderwerp zelf het doelproject.")"
+                echo "✅ zelf-routering — geen transfer"
+                exit 0
+              fi
+
+              # GEEN DEDUPE HIER (showcase-afwijking, zie de kop van dit bestand). De poort kán de
+              # doelrepo doorzoeken op mogelijke duplicaten, maar dan komen titels uit die repo in
+              # een comment op DEZE repo terecht. Zodra de twee repo's niet dezelfde zichtbaarheid
+              # hebben, is dat een lek — en de notificatiemail naar de indiener is al onderweg
+              # voordat de transfer het issue wegtrekt. Dedupliceren hoort in trap 1 van het
+              # doelproject, waar de domeinkennis zit die er iets zinnigs mee kan.
+              note=""
+
+              comment "$(printf '%s\n' \
+                "$MARKER" \
+                "📦 **Doorgestuurd naar \`$TARGET\`.**" \
+                "" \
+                "$REASON" \
+                "" \
+                "De raket van dat project pakt 'm nu op (triage → plan → bouw → PR). GitHub laat het oude nummer naar de nieuwe plek doorverwijzen." \
+                "$note")"
+
+              # NATIEVE transfer als allerlaatste stap: hierna bestaat dit issue hier niet meer,
+              # dus elke andere actie moet er al op staan.
+              gh issue transfer "$NUM" "$TARGET" --repo "$REPO"
+              echo "✅ getransfereerd naar $TARGET"
+              ;;
+
+            *)
+              echo "::error::onbekende beslissing '$DECISION' — dit hoort niet te kunnen"
+              exit 1
+              ;;
+          esac

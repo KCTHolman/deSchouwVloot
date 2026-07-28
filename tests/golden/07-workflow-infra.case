@@ -1,0 +1,10 @@
+titel: Auto-merge en de watchdog spreken elkaar tegen
+verwacht: transfer KCTHolman/fleet
+---
+## Doel
+De watchdog trapt een merge aan die auto-merge net heeft overgeslagen, waardoor dezelfde PR
+tweemaal beoordeeld wordt in de pijplijn. Na deze wijziging is er één beslisser.
+
+## Acceptatiecriteria
+- [ ] Een PR wordt nog maar door een van beide paden gemerged
+- [ ] De invariantenlijst dekt dit geval af

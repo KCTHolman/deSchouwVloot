@@ -1,0 +1,10 @@
+titel: Supabase-migratie voor de catalogustabel
+verwacht: transfer KCTHolman/BiohackOS
+---
+## Doel
+De catalogus-tabel mist een index op datum, waardoor het dagoverzicht traag laadt bij veel
+rijen. Na de migratie is die query weer snel.
+
+## Acceptatiecriteria
+- [ ] Er staat een index op de datumkolom van de catalogus-tabel
+- [ ] Het dagoverzicht laadt merkbaar sneller bij meer dan duizend rijen

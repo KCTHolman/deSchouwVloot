@@ -1,0 +1,85 @@
+name: "[fleet] Cleanup merged branch"
+
+# SPLITSING (M5 stap 3, 2026-07-28). Logica byte-identiek overgenomen uit BiohackOS; alleen het
+# trigger-blok werd `workflow_call`, want triggers horen bij de consument (I1). De caller met de
+# oorspronkelijke triggers staat onder dezelfde bestandsnaam in de consument-repo.
+#
+# Houdt de repo schoon: verwijdert de head-branch zodra een PR gemerged is.
+# Werkt ongeacht merge-type (squash/rebase/merge) en beschermt de vaste branches.
+# Zo blijft er geen woud aan afgewerkte feature-branches staan.
+
+on:
+  workflow_call:
+    inputs:
+      picker_runner:
+        type: string
+        required: false
+        default: biohack-light
+        description: >
+          Runner voor de beslis-job (`pick`) zelf. Doorgegeven aan pick-runner.yml; zie de
+          uitgebreide toelichting daar.
+
+          Een consument ZONDER self-hosted lanes moet hier `ubuntu-latest` zetten, anders hangt de
+          pick-job eeuwig in de wachtrij: runners zijn op een persoonlijk account repo-scoped, dus
+          `biohack-light` bestaat alleen voor BiohackOS. Geverifieerd 2026-07-28 bij InvestingOS
+          (run 30336854107 stond 50+ minuten queued na een gemergede PR).
+
+          Alleen DEZE waarde hoeft mee: `runner_label` mag gerust `biohack-light` blijven, want de
+          availability-check vindt daar geen runner en valt netjes terug op `fallback_label`
+          (ubuntu-latest). Het werk landt dus vanzelf goed; alleen de bootstrap-job kon dat niet.
+
+permissions:
+  contents: read
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    # RUN-COUNT-REDUCTIE (gitflow-audit 2026-07-11): elke pick-job is een betaalde
+    # ubuntu-minuut (GitHub factureert per job, afgerond naar boven) — ook wanneer alle
+    # jobs erna skippen. Deze gate is de OR van de job-gates hieronder: pick draait alleen
+    # als er echt werk volgt; skipt pick, dan skippen de needs-jobs automatisch mee.
+    if: >
+      vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == '' && (
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    # issue #789 (constitution-amendement 2026-07-11): self-hosted-eerst voor de hele
+    # gitflow-/agent-fleet — ook schedule-/issues-/PR-/workflow_run-context probeert
+    # de self-hosted lane; de ubuntu-latest-fallback blijft intact via pick-runner.yml.
+    with:
+      # Fase 3 van epic #1152: secondenwerk → het lichte spoor (2 slots, mag nooit achter
+      # zwaar werk wachten). Fallback blijft ubuntu-latest zolang de biohack-light-
+      # registratie nog niet online is.
+      runner_label: biohack-light
+      trusted_context_only: false
+      picker_runner: ${{ inputs.picker_runner }}
+
+  delete:
+    needs: pick
+    # Alleen bij een échte merge, en alleen voor branches in deze repo (geen forks).
+    if: >
+      always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success') && (
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 5 # #460: één delete-call
+    permissions:
+      contents: write
+    steps:
+      - name: Head-branch verwijderen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BR: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          # Vaste branches nooit verwijderen (een PR-head kan bijv. release of main zijn
+          # bij een promotie-PR).
+          case "$BR" in
+            main|acc|release|lab)
+              echo "Beschermde branch '$BR' — niet verwijderen."; exit 0 ;;
+          esac
+          echo "PR gemerged → branch '$BR' opruimen."
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/heads/${BR}" \
+            && echo "Verwijderd." \
+            || echo "Branch '$BR' bestond al niet meer — niets te doen."

@@ -1,0 +1,64 @@
+name: "[fleet] Runner-fleet assert"
+
+# SPLITSING (M5 stap 2, 2026-07-28). De logica is byte-identiek overgenomen uit BiohackOS; alleen
+# het trigger-blok is vervangen door `workflow_call`, want triggers horen bij de consument (I1).
+# De caller staat als `.github/workflows/runner-fleet-assert.yml` in de consument-repo en draagt
+# daar de schedule-, dispatch- en pull_request-paths-triggers.
+#
+# WAAROM `scripts/assert-runner-fleet.sh` NOG IN DE CONSUMENT STAAT. Dat script draagt
+# `AGENT_LANE_MAX`, en die waarde is consument-specifiek: hij volgt uit hoeveel agent-runners
+# DEZE repo heeft en of de sessie-isolatie daar bewezen is. `actions/checkout` pakt in een
+# reusable workflow de aanroeper, dus het script wordt gewoon gevonden. Het hoort uiteindelijk
+# hierheen mét de drempel in `.fleet.yml` — maar dat is parametriseren (fase 3/M6), niet
+# verhuizen. Eerst een-op-een over; verbeteren is een aparte stap.
+#
+# Bewaakt de agent-lane-invariant: lane `biohack-agent` heeft precies één online runner.
+#
+# WAAROM DIT EEN CHECK IS EN GEEN AANNAME. Alle elf claude-code-action-workflows draaien op die
+# lane, en die ene runner is wat ze serialiseert — de gedeelde concurrency-group die dat vroeger
+# deed is weg (zie `concurrency.group` in claude.yml voor de volledige rationale). Zolang de
+# runner-registraties hun home-map en dus hun agent-sessie delen, betekent een tweede agent-runner
+# dat twee agent-jobs tegelijk op één sessie landen en binnen ~1s stil sterven op turn 1
+# (#776/#778): de wrapper geeft exit 0, de job toont "success", en er ontstaat nooit een PR.
+# Zo'n regressie zie je niet aan een rode build — daarom deze assert.
+#
+# Opheffen doe je niet hier maar in het draaiboek: geef elke runner een eigen sessie-opslag,
+# verifieer met de gelijktijdigheidsproef, en verhoog dan AGENT_LANE_MAX in
+# scripts/assert-runner-fleet.sh.
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # Fase 2 (epic #636): kies de runner. Dit is secondenwerk (één curl + jq) en hoort dus op het
+  # lichte spoor — nadrukkelijk NIET op `biohack-agent`, want dan zou de assert in de wachtrij
+  # staan achter precies de claude-jobs die 'ie bewaakt.
+  pick:
+    if: vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == ''
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    with:
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  assert:
+    needs: pick
+    if: >
+      always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' ||
+      needs.pick.result == 'success')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Agent-lane-invariant verifiëren
+        env:
+          # Fine-grained PAT met Administration:Read — hetzelfde secret dat pick-runner.yml
+          # gebruikt. GITHUB_TOKEN volstaat niet: `administration` is geen geldige
+          # GITHUB_TOKEN-permissie, dus de runners-API is daarmee onbereikbaar.
+          RUNNER_CHECK_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: bash scripts/assert-runner-fleet.sh

@@ -1,0 +1,50 @@
+# .fleet.yml — het consumer-contract van deFleet ZELF.
+#
+# deFleet is z'n eigen eerste extra consument (docs/architectuur.md §3b): fleet-infrawerk routeert
+# hierheen en loopt door dezelfde stations als elk ander project. Dit bestand is daarmee meteen het
+# levende voorbeeld van het contract — en het bewijs dat een consument ZONDER self-hosted runners
+# gewoon werkt.
+#
+# Schema + validator: scripts/check-fleet-yml.py (strikt op onbekende sleutels — een typefout mag
+# nooit stilzwijgend een default activeren die niemand koos).
+
+version: 1
+
+# Deze repo heeft geen self-hosted runners: alle lanes wijzen naar de fallback. Dat is een geldige
+# configuratie, geen tekortkoming — de zwaarte van een lane zegt iets over de consument, niet over
+# de fleet-logica die 'm aanroept.
+lanes:
+  agent: ubuntu-latest
+  heavy: ubuntu-latest
+  light: ubuntu-latest
+  fallback: ubuntu-latest
+
+gates:
+  # Geen mens-poort op features: deze repo bevat alleen machinerie, geen product. Verandert dat,
+  # dan gaat deze op `true` en wacht een feature-PR hier ook op approval.
+  feature_approval: false
+  # Geen productie-omgeving: deFleet levert niets uit.
+  release_environment: null
+
+budgets:
+  default_model: claude-sonnet-5
+  escalation_model: claude-opus-5
+  # Turn-budget per station (docs/gitflow.md §13). Lager dan bij een productrepo: infrawerk raakt
+  # weinig bestanden en veel van het werk is lezen en redeneren, niet grootschalig wijzigen.
+  max_turns:
+    triage: 20
+    plan: 40
+    build: 60
+    review: 30
+
+# Het gedeelde woordenboek. Labels reizen NIET mee bij een issue-transfer — alleen namen die in de
+# doelrepo bestaan overleven. Daarom moet elke consument deze drie garanderen.
+labels:
+  task: fleet-task
+  human: needs-human
+  epic: epic
+
+# Workflows waarvan uitval stil zou zijn (I25). Voor deFleet is dat de poort: valt die uit, dan
+# verdwijnen ideeën in het niets zonder dat iets het meldt.
+spine:
+  - intake.yml

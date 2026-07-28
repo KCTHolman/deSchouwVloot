@@ -1,0 +1,75 @@
+name: "[fleet] Branch-protection assert"
+
+# SPLITSING (M5 stap 3, 2026-07-28). Logica byte-identiek overgenomen uit BiohackOS; alleen het
+# trigger-blok werd `workflow_call`, want triggers horen bij de consument (I1). De caller met de
+# oorspronkelijke triggers staat onder dezelfde bestandsnaam in de consument-repo.
+#
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+  # "administration" is GEEN geldige GITHUB_TOKEN-permissie (niet in de door GitHub
+  # ondersteunde permissions-lijst) — opnemen hier maakt de workflow ongeldig en laat
+  # ELKE run stuklopen vóór er ook maar één job start (0 jobs, altijd "failure"). Het
+  # lezen van branch-protection/rulesets kan daarom alleen via een PAT, zie hieronder.
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    # Fase 2 van epic #1152: override opgesplitst per spoor (zelfde skip-truc als #1063, nu
+    # per lane) — RUNNER_OVERRIDE_LIGHT pint dit spoor; de ongesplitste RUNNER_OVERRIDE blijft
+    # als globale fallback bestaan naast, niet i.p.v.
+    if: vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == ''
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    # issue #789 (constitution-amendement 2026-07-11): self-hosted-eerst voor de hele
+    # gitflow-/agent-fleet — ook schedule-/issues-/PR-/workflow_run-context probeert
+    # de self-hosted lane; de ubuntu-latest-fallback blijft intact via pick-runner.yml.
+    with:
+      # Fase 3 van epic #1152: secondenwerk → het lichte spoor (2 slots, mag nooit achter
+      # zwaar werk wachten). Fallback blijft ubuntu-latest zolang de biohack-light-
+      # registratie nog niet online is.
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  assert:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 5
+    env:
+      # GITHUB_TOKEN kan NIET geautoriseerd worden voor branch-protection/rulesets-endpoints
+      # (die vereisen "Administration"-scope, die GITHUB_TOKEN niet kan krijgen). Zet een
+      # fine-grained PAT met "Administration: read" als secret ASSERT_ADMIN_TOKEN — zonder
+      # dat secret faalt de assertie met 403 op de protection/ruleset-reads (zichtbaar als
+      # "kon de actual state niet lezen" hierboven, niet als een kapotte workflow).
+      GH_TOKEN: ${{ secrets.ASSERT_ADMIN_TOKEN || github.token }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: yq (mikefarah) installeren indien afwezig
+        # github-hosted ubuntu-runners hebben mikefarah/yq al in de tool-cache; de
+        # self-hosted-eerst-routering (#789) kan deze job ook op de self-hosted lane plaatsen,
+        # waar 'm ontbreekt (of waar apt's "yq" — de incompatibele python/jq-wrapper —
+        # in de weg zou zitten). Zonder host-state-aanname: check op de `-o=json`-vlag die
+        # alleen mikefarah/yq kent, niet enkel op `command -v yq`.
+        run: |
+          if ! yq --help 2>/dev/null | grep -q -- '-o, --output-format'; then
+            mkdir -p "$HOME/.local/bin"
+            curl -fsSL -o "$HOME/.local/bin/yq" https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+            chmod +x "$HOME/.local/bin/yq"
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Assert branch-protection settings-as-code
+        # Op een PR is dit een ADVISORY drift-check: hij kan structureel niet groen worden
+        # zolang de owner-side ruleset/secret nog niet staan (owner-only werk, zie #402), dus
+        # hard falen zou elke settings-as-code-PR permanent blokkeren — auto-merge.yml telt élke
+        # rode check als "CI niet groen". Daarom --warn-only op pull_request: drift wordt wél
+        # geannoteerd, maar faalt de PR-check niet. Op schedule/workflow_dispatch blijft de
+        # assertie HARD falen — dat is de wekelijkse handhaving die de eigenaar op echte drift pingt.
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            bash scripts/assert-branch-protection.sh --warn-only
+          else
+            bash scripts/assert-branch-protection.sh
+          fi

@@ -1,0 +1,42 @@
+name: "[fleet] probe (caller)"
+
+# Plak dit als `.github/workflows/fleet-probe.yml` in een consument-repo (BiohackOS eerst).
+# Dit is de aanroepkant van deFleet's probe — het bewijst dat cross-repo reusable workflows
+# resolven en dat de self-hosted lanes van DEZE repo eruit rollen.
+#
+# Bewust `workflow_dispatch`-only: dit is diagnostisch gereedschap, geen bewaker. Het draait
+# nooit vanzelf en het blokkeert geen enkele PR.
+#
+# VOLGORDE VAN TESTEN (niet overslaan):
+#   1. Draai 'm eerst met de default `ubuntu-latest`. Faalt dit met "workflow was not found",
+#      dan staat de Access-instelling van KCTHolman/fleet nog niet open — zie de deFleet-README.
+#   2. Pas als stap 1 groen is, draai 'm met `biohack-light`. Blijft de job queuen, dan is de
+#      lichte lane offline (of het label klopt niet), niet de cross-repo-aanroep.
+#
+# `biohack-agent` NIET gebruiken om te testen: die lane heeft 1 slot en houdt daarmee het echte
+# agent-werk op.
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        type: choice
+        required: true
+        default: ubuntu-latest
+        description: Runner om de probe op te draaien
+        options:
+          - ubuntu-latest
+          - biohack-light
+          - biohack-heavy
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    uses: KCTHolman/fleet/.github/workflows/probe.yml@main
+    # `secrets: inherit` is hier bewust WEGGELATEN: de probe vraagt geen secrets, en dit is
+    # meteen het bewijs dat een fleet-workflow zonder secrets kan draaien. Pas bij pick-runner
+    # (die RUNNER_CHECK_TOKEN nodig heeft) komt `secrets: inherit` erbij.
+    with:
+      runner: ${{ inputs.runner }}

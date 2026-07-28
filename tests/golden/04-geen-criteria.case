@@ -1,0 +1,6 @@
+titel: Importscanner sneller maken
+verwacht: detail
+---
+## Doel
+De importscanner moet merkbaar sneller worden voor grote bestanden, want nu duurt het te lang
+voordat je iets ziet.

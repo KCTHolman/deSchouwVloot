@@ -1,0 +1,114 @@
+name: "[fleet] Issue → release (zij-spoor)"
+
+# SPLITSING (M5 stap 4, 2026-07-28). Logica byte-identiek uit BiohackOS; alleen het trigger-blok
+# werd `workflow_call`, want triggers horen bij de consument (I1). De caller staat onder dezelfde
+# bestandsnaam in de consument-repo.
+# De `concurrency`-groep is bewust NIET meeverhuisd: die dedupliceert TRIGGER-events en hoort
+# dus bij de caller, samen met de trigger zelf.
+#
+# Los zij-spoor náást de issue-raket (het interne draaiboek): een issue met het label
+# `release-nu` dispatcht rechtstreeks `promote-release.yml` (main → release, die op zijn beurt
+# release.yml start). Dit issue draagt GEEN code-wijziging — het is puur een knop, geen plan/bouw
+# nodig. De bestaande `production`-deploy-poort (required reviewer vóór de gesignde APK, zie
+# het interne draaiboek) blijft onaangetast vóór de publicatie staan: dit workflow
+# promoot alleen `main` → `release`, het omzeilt geen goedkeuring.
+
+on:
+  workflow_call: {}
+
+# LEAST-PRIVILEGE (zelfde patroon als issue-triage.yml): restrictieve wf-default, elke job vraagt
+# zelf de minst-nodige write-set aan.
+permissions:
+  contents: read
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze jobs.
+  pick:
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    # RUN-COUNT-REDUCTIE (gitflow-audit 2026-07-11): elke pick-job is een betaalde
+    # ubuntu-minuut (GitHub factureert per job, afgerond naar boven) — ook wanneer alle
+    # jobs erna skippen. Deze gate is de OR van de job-gates hieronder: pick draait alleen
+    # als er echt werk volgt; skipt pick, dan skippen de needs-jobs automatisch mee.
+    if: >
+      vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == '' && (
+      github.event.action == 'opened' ||
+      (github.event.action == 'labeled' && github.event.label.name == 'release-nu'))
+    # issue #789 (constitution-amendement 2026-07-11): self-hosted-eerst voor de hele
+    # gitflow-/agent-fleet — ook schedule-/issues-/PR-/workflow_run-context probeert
+    # de self-hosted lane; de ubuntu-latest-fallback blijft intact via pick-runner.yml.
+    with:
+      # Fase 3 van epic #1152: secondenwerk → het lichte spoor (2 slots, mag nooit achter
+      # zwaar werk wachten). Fallback blijft ubuntu-latest zolang de biohack-light-
+      # registratie nog niet online is.
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  # Zorgt dat het label bestaat zodra er een issue geopend wordt, zodat je 'm bij een NIEUW issue
+  # al kunt kiezen (een label moet bestaan vóórdat je 'm kunt toevoegen).
+  ensure-label:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success') && (github.event.action == 'opened')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 3
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Label idempotent aanmaken
+        run: |
+          set -euo pipefail
+          gh label create 'release-nu' --repo "$REPO" --color 'B60205' \
+            --description 'Issue-knop: dispatcht promote-release.yml (main → release)' 2>/dev/null || true
+
+  release:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success') && (github.event.action == 'labeled' && github.event.label.name == 'release-nu')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+      actions: write # om promote-release.yml te dispatchen
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      NUM: ${{ github.event.issue.number }}
+      OWNER: ${{ github.repository_owner }}
+      ACTOR: ${{ github.actor }}
+    steps:
+      # ACTOR-GATE (zelfde patroon als issue-triage.yml): alleen de repo-owner of een bot
+      # (raket-cascade/watchdog) mag deze knop indrukken — voorkomt dat een onvertrouwde
+      # actor via een label een productie-release afdwingt.
+      - name: Actor-gate
+        run: |
+          set -euo pipefail
+          case "$ACTOR" in
+            "$OWNER"|*'[bot]') : ;;
+            *)
+              echo "Trigger door onvertrouwde actor '$ACTOR' — release overslaan."
+              gh issue comment "$NUM" --repo "$REPO" --body \
+                "⛔ Label \`release-nu\` genegeerd: alleen \`$OWNER\` (of een pijplijn-bot) mag een release starten." \
+                || true
+              gh issue edit "$NUM" --repo "$REPO" --remove-label 'release-nu' || true
+              exit 1 ;;
+          esac
+
+      - name: Promote-release dispatchen
+        run: |
+          set -euo pipefail
+          gh workflow run promote-release.yml --repo "$REPO" --ref main \
+            -f reason="issue #${NUM}"
+
+      - name: Comment + issue sluiten
+        run: |
+          set -euo pipefail
+          run_url="https://github.com/${REPO}/actions/workflows/promote-release.yml"
+          gh issue comment "$NUM" --repo "$REPO" --body \
+            "🚀 Release gestart: \`promote-release.yml\` gedispatcht (main → release). release.yml
+          bouwt en signt daarna de APK — de \`production\`-approval-poort staat daar nog vóór de
+          publicatie. Voortgang: ${run_url}"
+          gh issue close "$NUM" --repo "$REPO" --reason completed

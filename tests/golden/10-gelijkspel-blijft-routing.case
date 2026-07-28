@@ -1,0 +1,9 @@
+titel: Voorraad opnieuw inrichten
+verwacht: routing
+---
+## Doel
+De workflow die dit doet moet anders, want het gebeurt nu op twee plekken tegelijk.
+
+## Acceptatiecriteria
+- [ ] De gewijzigde situatie is zichtbaar en meetbaar na de wijziging
+- [ ] Er is een test die precies dat geval afdekt en faalt zonder de fix

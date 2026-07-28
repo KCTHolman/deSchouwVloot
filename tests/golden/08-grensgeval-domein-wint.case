@@ -1,0 +1,9 @@
+titel: Tegel voor het rapport op het dashboard
+verwacht: transfer KCTHolman/BiohackOS
+---
+## Doel
+De tegel blijft leeg sinds de wijziging van gisteren, terwijl de gegevens er wel zijn. De workflow eromheen wijzigde gisteren.
+
+## Acceptatiecriteria
+- [ ] De gewijzigde situatie is zichtbaar en meetbaar na de wijziging
+- [ ] Er is een test die precies dat geval afdekt en faalt zonder de fix

@@ -1,0 +1,69 @@
+name: "[fleet] Release storage cleanup"
+
+# SPLITSING (M5 stap 4, 2026-07-28). Logica byte-identiek uit BiohackOS; alleen het trigger-blok
+# werd `workflow_call`, want triggers horen bij de consument (I1). De caller staat onder dezelfde
+# bestandsnaam in de consument-repo.
+# De `keep`-dispatch-input is meeverhuisd als workflow_call-input; de caller geeft 'm door.
+#
+# Elke release.yml-run hangt een gesigneerde APK aan de GitHub Release (softprops/action-gh-release).
+# Die assets tellen mee in de Actions/repo-storage en groeien onbegrensd — er was nog geen opruiming.
+# Deze workflow bewaart alleen de laatste N releases (assets + release-entry); de git-tag zelf blijft
+# altijd staan (géén --cleanup-tag) zodat versiegeschiedenis/changelog intact blijft en een oudere APK
+# bij nood alsnog uit de tag te herbouwen is.
+
+on:
+  workflow_call:
+    inputs:
+      keep:
+        type: number
+        required: false
+        default: 5
+        description: Aantal meest recente releases om te bewaren.
+
+permissions:
+  contents: read
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    if: vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == ''
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    with:
+      # Secondenwerk → het lichte spoor (2 slots, mag nooit achter zwaar werk wachten).
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  sweep:
+    needs: pick
+    if: always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success')
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 10 # #460: loopt releases af, elke delete-call is een aparte API-round-trip
+    permissions:
+      contents: write
+    steps:
+      - name: Releases ouder dan de laatste N verwijderen (tags blijven staan)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          KEEP: ${{ inputs.keep || 5 }}
+        run: |
+          set -euo pipefail
+
+          old_tags="$(gh release list --repo "$REPO" --limit 1000 --json tagName,createdAt \
+            --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName")"
+
+          if [ -z "$old_tags" ]; then
+            echo "$KEEP of minder releases aanwezig — niets op te ruimen."
+            exit 0
+          fi
+
+          echo "Releases buiten de laatste $KEEP, worden verwijderd (tag blijft staan):"
+          printf '%s\n' "$old_tags"
+
+          printf '%s\n' "$old_tags" | while read -r tag; do
+            [ -z "$tag" ] && continue
+            gh release delete "$tag" --repo "$REPO" --yes \
+              && echo "Verwijderd: $tag" \
+              || echo "Kon '$tag' niet verwijderen (al weg?)."
+          done

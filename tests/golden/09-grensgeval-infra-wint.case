@@ -1,0 +1,9 @@
+titel: Runner-lane voor de app-build
+verwacht: transfer KCTHolman/fleet
+---
+## Doel
+De lane valt weg en de app-build wacht dan eindeloos in plaats van uit te wijken.
+
+## Acceptatiecriteria
+- [ ] De gewijzigde situatie is zichtbaar en meetbaar na de wijziging
+- [ ] Er is een test die precies dat geval afdekt en faalt zonder de fix

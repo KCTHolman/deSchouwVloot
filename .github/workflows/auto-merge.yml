@@ -1,0 +1,547 @@
+name: "[fleet] Auto-merge & promote"
+
+# SPLITSING (M5 stap 6 — DE SPINE, 2026-07-28). Logica byte-identiek uit BiohackOS; alleen het
+# trigger-blok werd `workflow_call` en de `concurrency`-groep bleef bij de caller (die dedupliceert
+# TRIGGER-events en hoort dus bij wie de triggers heeft).
+#
+# WAAROM DIT DE LAATSTE VERHUIZING VAN M5 IS. Dit is de motor die groene fix/chore-PR's zonder mens
+# doorlaat; historisch gemeten op 100% success. De werkregel eist dat de doctor-consistentiemodule
+# bij de consument draait vóór deze stap — dat is sinds BiohackOS#1721 (2026-07-28) het geval.
+#
+# EXTRA GUNSTIG MOMENT: auto-merge staat sinds 2026-07-18 `disabled_manually`. Er hangt op dit
+# moment dus niets van af, waardoor deze verhuizing niets kan breken dat draait. Zodra de eigenaar 'm weer
+# inschakelt, schakelt 'ie meteen de gemigreerde versie in — één verificatieronde in plaats van
+# twee, en geen sleutelen aan een levende spine.
+#
+# De hands-off merge-laag (pijplijn-herziening juli 2026). Zie het interne draaiboek.
+#
+# Beleid (base = `main`):
+#   • Kleine, niet-breaking PR (fix/chore/docs/refactor/test/ci/perf/build/style)
+#       → auto-merge naar main zodra CI groen is. GEEN release. UITZONDERING (issue #570): raakt
+#         de diff een gevoelig pad (SportBit/secrets/DB-migraties/nieuwe netwerk-bestemming, zie
+#         scripts/sensitive-paths-guard.sh) dan forceert de guard een menselijke approval — ook op
+#         deze normale lane, niet alleen bij `auto-error`.
+#   • Dependency-PR (label `auto-deps`)
+#       → auto-merge naar main zodra CI groen is. GEEN release.
+#   • Auto-gerapporteerde fout (label `auto-error`, non-breaking `fix`) — epic #360 fase 3
+#       → auto-merge naar main ÉN promote-release, ZONDER menselijke poort, mits de
+#         gevoelige-paden-guard (scripts/sensitive-paths-guard.sh) schoon is. Raakt de diff een
+#         gevoelig pad (SportBit/secrets/DB-migraties/nieuwe netwerk-bestemming) → approval
+#         geforceerd (valt terug op jouw PR-approval). `feat`/breaking `auto-error` → gewone
+#         approval-flow hieronder. Vastgelegd in constitution.md §Versoepeld + pipeline-beleid.md.
+#   • Feature PR met GOEDGEKEURD PLAN (label `plan-goedgekeurd`, niet-breaking)
+#       → "gate één keer": het plan is in trap 2 al door de eigenaar goedgekeurd, dus deze merget op
+#         groene CI ZONDER tweede approval. GEEN automatische release (zie hieronder).
+#   • Feature zonder goedgekeurd plan / breaking PR — VOLAUTOMATISCH sinds 2026-07-20 (op
+#     expliciet verzoek van de eigenaar, zie chat + constitution.md §Versoepeld)
+#       → merge naar main zodra CI groen is ÉN (JOUW approval OF een APPROVED review van de
+#         vertrouwde AI-reviewer, pr-review.yml) — GEEN sensitief pad geraakt. Raakt de diff een
+#         gevoelig pad (SportBit/secrets/DB-migraties/nieuwe netwerk-bestemming, zie
+#         scripts/sensitive-paths-guard.sh) dan telt UITSLUITEND jouw eigen approval — de guard
+#         forceert die uitzondering ongeacht wat de AI-reviewer zegt. GEEN automatische release:
+#         sinds issue #476 promoot een feature/breaking-merge NIET meer vanzelf main → release —
+#         dat triggerde één dure gesignde-APK-build per feature. Features stapelen op `main` en de
+#         release trap je HANDMATIG aan (Actions → Promote to release · label `release-nu` ·
+#         kanban-sleep naar "Released"). Zo bundel je meerdere feats in één APK.
+#
+# Escape hatches (labels): `no-automerge` (nooit auto-mergen) · `hold-release` (blokkeert de
+# auto-error-auto-release; features releasen sinds #476 sowieso niet meer vanzelf).
+# `CHANGES_REQUESTED` van jou blokkeert altijd. PR's richting acc/lab/release: handmatig.
+#
+# Drie triggers die samen elke volgorde afdekken: de PR-check die groen wordt, de
+# impactanalyse (feature-governance) die afrondt, én jouw approval.
+
+on:
+  workflow_call: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # Fase 2 (epic #636): kies de runner voor deze job.
+  pick:
+    uses: KCTHolman/fleet/.github/workflows/pick-runner.yml@main
+    secrets: inherit # geeft RUNNER_CHECK_TOKEN door (leeg = veilige fallback op ubuntu-latest)
+    # RUN-COUNT-REDUCTIE (gitflow-audit 2026-07-11): elke pick-job is een betaalde
+    # ubuntu-minuut (GitHub factureert per job, afgerond naar boven) — ook wanneer alle
+    # jobs erna skippen. Deze gate is de OR van de job-gates hieronder: pick draait alleen
+    # als er echt werk volgt; skipt pick, dan skippen de needs-jobs automatisch mee.
+    if: >
+      vars.RUNNER_OVERRIDE_LIGHT == '' && vars.RUNNER_OVERRIDE == '' && (
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved'))
+    # issue #789 (constitution-amendement 2026-07-11): self-hosted-eerst voor de hele
+    # gitflow-/agent-fleet — ook schedule-/issues-/PR-/workflow_run-context probeert
+    # de self-hosted lane; de ubuntu-latest-fallback blijft intact via pick-runner.yml.
+    with:
+      # Fase 3 van epic #1152: secondenwerk → het lichte spoor (2 slots, mag nooit achter
+      # zwaar werk wachten). Fallback blijft ubuntu-latest zolang de biohack-light-
+      # registratie nog niet online is.
+      runner_label: biohack-light
+      trusted_context_only: false
+
+  evaluate:
+    needs: pick
+    # PROVENANCE (fase 3, epic #204 → herzien 2026-07-20 op expliciet verzoek van de eigenaar). Tot
+    # 2026-07-20 telde de review-route UITSLUITEND een approval van de repo-owner (de eigenaar): de
+    # autonome review-agent (pr-review.yml) kon met `gh pr review --approve` een approval-event
+    # afvuren dat auto-merge triggerde en zo een door "Claude" gebouwde PR door een andere
+    # "Claude"-run liet goedkeuren — een self-approval-lus zonder onafhankelijke mensencheck.
+    # de eigenaar heeft die lus BEWUST opengezet (volautomatisch mergen op AI-approve + groene CI): de
+    # `evaluate`-stap hieronder telt nu zowel een owner-approval als een APPROVED review van de
+    # vertrouwde reviewer-bots (zie `ai_review`/`ai_approved` verderop). De ENIGE grens die
+    # overeind blijft is de gevoelige-paden-guard: raakt de diff SportBit/secrets/DB-migraties/
+    # een nieuwe netwerk-bestemming, dan telt daar UITSLUITEND een echte owner-approval (zie
+    # `$sensitive && ! $approved`-checks verderop) — een AI-approve volstaat daar nooit. De
+    # CI-groen-route (workflow_run) dekt de merges die sowieso geen approval nodig hebben.
+    if: >
+      always() && (vars.RUNNER_OVERRIDE_LIGHT != '' || vars.RUNNER_OVERRIDE != '' || needs.pick.result == 'success') && (
+      (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.event == 'pull_request' &&
+        github.event.workflow_run.conclusion == 'success') ||
+      (github.event_name == 'pull_request_review' &&
+        github.event.review.state == 'approved'))
+    runs-on: ${{ vars.RUNNER_OVERRIDE_LIGHT || vars.RUNNER_OVERRIDE || needs.pick.outputs.runner }}
+    timeout-minutes: 10 # #460: paar gh-api-calls, geen build
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write # zodat "Fixes #N" het gekoppelde issue ook echt sluit bij de squash-merge
+      actions: write # om promote-release.yml te dispatchen
+      checks: read # statusCheckRollup: check-runs lezen (gh pr view)
+      statuses: read # statusCheckRollup: commit-statuses lezen
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      OWNER: ${{ github.repository_owner }}
+    steps:
+      # Checkout is nodig zodat scripts/sensitive-paths-guard.sh (de gevoelige-paden-guard, epic
+      # #360 fase 3) beschikbaar is. Draait op de default branch-versie (main) — daar staat de
+      # gesanctioneerde guard, niet de PR-versie, zodat een PR z'n eigen guard niet kan verzwakken.
+      - name: Checkout (voor de gevoelige-paden-guard)
+        uses: actions/checkout@v7
+
+      - name: Bepaal PR-nummer
+        id: pr
+        env:
+          EVENT: ${{ github.event_name }}
+          BRANCH: ${{ github.event.workflow_run.head_branch }}
+          REVIEW_PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request_review" ]; then
+            num="$REVIEW_PR"
+          else
+            num="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open \
+                     --json number --jq '.[0].number' || true)"
+          fi
+          if [ -z "${num:-}" ]; then
+            echo "Geen open PR gevonden — niets te doen."
+            echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "num=$num" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Evalueer beleid & merge
+        if: steps.pr.outputs.skip == 'false'
+        env:
+          NUM: ${{ steps.pr.outputs.num }}
+        run: |
+          set -euo pipefail
+          json="$(gh pr view "$NUM" --repo "$REPO" \
+            --json number,state,title,body,baseRefName,headRefName,headRefOid,isDraft,reviewDecision,reviews,labels,statusCheckRollup)"
+
+          state="$(echo "$json"    | jq -r '.state')"
+          [ "$state" = "OPEN" ] || { echo "PR #$NUM is $state — niets te doen."; exit 0; }
+          [ "$(echo "$json" | jq -r '.isDraft')" = "false" ] || { echo "Draft — overslaan."; exit 0; }
+
+          base="$(echo "$json"     | jq -r '.baseRefName')"
+          title="$(echo "$json"    | jq -r '.title')"
+          body="$(echo "$json"     | jq -r '.body // ""')"
+          decision="$(echo "$json" | jq -r '.reviewDecision // ""')"
+          labels="$(echo "$json"   | jq -r '.labels[].name' | tr '\n' ' ')"
+          has() { printf ' %s ' "$labels" | grep -q " $1 "; }
+
+          [ "$base" = "main" ] || { echo "Base=$base (niet main) — geen auto-merge."; exit 0; }
+          if has 'no-automerge'; then echo "Label no-automerge — overslaan."; exit 0; fi
+          if [ "$decision" = "CHANGES_REQUESTED" ]; then echo "Changes requested — overslaan."; exit 0; fi
+
+          # --- STALE / AL-GEMERGEDE HEAD? (issue #263, uitgebreid in #1609) -----------------
+          # Na een Actions-storing kan een oude dispatch uren later alsnog draaien tegen een
+          # branch waarvan de inhoud al op main staat (bv. de PR is al handmatig gemerged, of
+          # een identieke duplicaat-PR is al gemerged). Zonder deze guard maakt auto-merge dan
+          # een no-op merge-commit van code die al op main stond — reproduceerbaar gebeurd op
+          # 2026-07-03 (PR #158/#176). En bij een stale head die inmiddels afwijkt van de branch
+          # kan zo'n late dispatch zelfs een ONgewenste merge veroorzaken.
+          #
+          # Guard = de `git merge-base --is-ancestor head base`-semantiek, maar zonder dure
+          # checkout: de compare-API geeft precies dezelfde relatie. `compare/base...head`:
+          #   • status "identical" → head == base-tip (zelfde commit)
+          #   • status "behind"    → head is een ancestor van base (inhoud staat al volledig op base)
+          # Deze repo gebruikt squash-merge: elke merge naar main krijgt een NIEUWE commit-SHA,
+          # dus de head-commit van een content-identieke duplicaat-PR wordt nooit een letterlijke
+          # ancestor van main en rapporteert "diverged" i.p.v. "behind" — de ancestor-check alleen
+          # was hier structureel blind voor. Reproduceerbaar gebeurd op 2026-07-24 (PR #1537/#1539,
+          # zelfde head-commit, #1539 mergede als lege no-op squash-commit). Daarom: "diverged" mét
+          # 0 gewijzigde bestanden t.o.v. base betekent ook dat de inhoud al op base staat → ook
+          # sluiten als duplicaat. ("ahead"/"diverged" mét ≥1 bestand = de PR heeft nog eigen
+          # wijzigingen → normale merge-flow hieronder.) Zie #1609/#1537/#1539.
+          head_oid="$(echo "$json" | jq -r '.headRefOid // ""')"
+          if [ -n "$head_oid" ]; then
+            cmp_json="$(gh api "repos/$REPO/compare/$base...$head_oid" 2>/dev/null || echo '')"
+            cmp_status="$(echo "$cmp_json" | jq -r '.status // ""' 2>/dev/null || echo '')"
+            cmp_files="$(echo "$cmp_json" | jq -r '.files | length' 2>/dev/null || echo '')"
+            if [ "$cmp_status" = "identical" ] || [ "$cmp_status" = "behind" ] \
+               || { [ "$cmp_status" = "diverged" ] && [ "$cmp_files" = "0" ]; }; then
+              echo "Head $head_oid staat al op $base (compare=$cmp_status, files=$cmp_files) — stale/al-gemergede dispatch."
+              gh pr close "$NUM" --repo "$REPO" \
+                --comment "🤖 Auto-merge-guard: de head-commit van deze PR staat al volledig op \`$base\` (compare-status: \`$cmp_status\`, gewijzigde bestanden: \`$cmp_files\`). Waarschijnlijk een stale of dubbele dispatch (bv. een late re-run na een Actions-storing, of een squash-merge-duplicaat). Gesloten als duplicaat i.p.v. een no-op merge-commit te maken. Zie #263/#1609." \
+                || echo "::warning::Kon duplicaat-PR #$NUM niet sluiten."
+              exit 0
+            fi
+          else
+            echo "::warning::Geen headRefOid gevonden — stale-head-guard overgeslagen."
+          fi
+
+          # --- CI groen? -------------------------------------------------------------------
+          # statusCheckRollup bevat élke check-run die ooit op deze commit is gepost — ook een
+          # run die is CANCELLED doordat een latere PR-event (bv. een label) de
+          # cancel-in-progress-concurrency van feature-governance.yml/pr-check.yml een eerder
+          # in-flight run liet afbreken. Die geannuleerde run blijft permanent in de rollup staan
+          # náást de daaropvolgende geslaagde run met dezelfde naam. Zonder dedup telt zo'n
+          # verweesde CANCELLED voor altijd mee als "fail", ook als alles inmiddels groen is —
+          # dedupliceer daarom per checknaam/context naar de laatste (recentste) uitkomst.
+          latest="$(echo "$json" | jq -c '
+            [.statusCheckRollup[]?
+              | {key: (.name // .context // "?"),
+                 ts:  (.completedAt // .startedAt // .createdAt // ""),
+                 concl: (.conclusion // .state // "")}]
+            | group_by(.key)
+            | map(max_by(.ts))
+          ')"
+          gate="$(echo "$latest" | jq -r '[.[] | select(.key=="PR check gate") | .concl] | .[0] // ""')"
+          # impactanalyse is sinds de ruleset op main (2026-07-11, issue #791) een required
+          # check. SKIPPED telt als voldaan (zelfde semantiek als de ruleset); alles anders dan
+          # SUCCESS/SKIPPED is "nog niet klaar" — het volgende workflow_run-event van
+          # feature-governance evalueert dan opnieuw.
+          impact="$(echo "$latest" | jq -r '[.[] | select(.key=="impactanalyse") | .concl] | .[0] // ""')"
+          fails="$(echo "$latest" | jq -r '[.[] | select(.concl=="FAILURE" or .concl=="CANCELLED" or .concl=="TIMED_OUT" or .concl=="ACTION_REQUIRED" or .concl=="ERROR")] | length')"
+          if [ "$gate" != "SUCCESS" ] || [ "$fails" != "0" ]              || { [ "$impact" != "SUCCESS" ] && [ "$impact" != "SKIPPED" ]; }; then
+            echo "CI nog niet groen (gate=$gate, impactanalyse=$impact, fails=$fails) — wachten."; exit 0
+          fi
+
+          # --- Type & approval -------------------------------------------------------------
+          feat=false; breaking=false; approved=false
+          printf '%s' "$title" | grep -qiE '^feat(\([^)]+\))?!?:' && feat=true
+          printf '%s' "$title" | grep -qE  '^[a-z]+(\([^)]+\))?!:' && breaking=true
+          # PROVENANCE (fase 3, epic #204). $approved telt UITSLUITEND een expliciete approval van
+          # de repo-owner (de eigenaar) — de autonome review-agent telt hier bewust niet mee (zie
+          # $ai_approved verderop voor die route). We leiden dit niet af uit `reviewDecision` (dat
+          # wordt óók APPROVED bij een bot-approve), maar uit de laatste beslissende OWNER-review;
+          # approve-daarna-dismiss telt dus niet mee. Onderscheid $approved/$ai_approved blijft
+          # nodig omdat de gevoelige-paden-guard verderop UITSLUITEND $approved accepteert.
+          owner_review="$(echo "$json" | jq -r '
+            [ .reviews[]?
+              | select(.authorAssociation == "OWNER")
+              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED") ]
+            | last | .state // ""' 2>/dev/null || true)"
+          [ "$owner_review" = "APPROVED" ] && approved=true
+
+          # AI-REVIEW-APPROVAL (2026-07-20, op expliciet verzoek van de eigenaar: volautomatisch mergen
+          # zodra CI groen is en de AI-reviewer goedkeurt). Zelfde provenance-patroon als
+          # owner_review hierboven: leid dit NIET af uit reviewDecision (dat wordt ook APPROVED
+          # bij een bot-approve — precies waar we hier bewust op leunen, maar wél met een
+          # geverifieerde actor i.p.v. een willekeurige derde die toevallig write-access heeft).
+          # Trusted set = dezelfde drie actors als de plan-goedgekeurd-herkomstcheck verderop.
+          # BELANGRIJK: $ai_approved telt NOOIT mee op een gevoelig pad — zie de
+          # `$sensitive && ! $approved`-checks verderop, die bewust `$approved` (owner-only)
+          # gebruiken, niet `$approved || $ai_approved`.
+          ai_review="$(echo "$json" | jq -r '
+            [ .reviews[]?
+              | select(.author.login == "claude[bot]" or .author.login == "github-actions[bot]" or .author.login == "defleet-machinerie[bot]")
+              | select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED") ]
+            | last | .state // ""' 2>/dev/null || true)"
+          ai_approved=false
+          [ "$ai_review" = "APPROVED" ] && ai_approved=true
+
+          # --- I20: DE REVIEW-NOODREM ------------------------------------------------------
+          # gitflow §3.2: één of meer bewijsbare `blockers` in het review-verdict zetten het label
+          # `review-blocker` → "de merge-machine behandelt de PR als feature (WACHT OP MENS) tot
+          # het label weg is". De beslissing óf dat label er komt is bewust geen `if` in deze
+          # workflow maar `noodrem-beslis.sh` (24 tests): daar trekken twee biassen tegengesteld —
+          # op INHOUD remmen bij twijfel, op INFRASTRUCTUUR nooit (een review-storing zet nooit een
+          # blocker, anders legt één flaky run de hele pijplijn stil).
+          #
+          # WAAROM HIER, EN NIET `feat=true` VERDEROP. "Als feature behandelen" is niet genoeg: een
+          # niet-breaking feature met `plan-goedgekeurd` merget via de gate-één-keer-route zónder
+          # tweede approval, en dan zou de rem stilzwijgend niets doen. "Wacht op mens" is de eis,
+          # dus dit is een vroege uitstap vóór élke merge-tak.
+          #
+          # En bewust `$approved` (owner-only), niet `$ai_approved`: dit label ontstaat uit een
+          # AI-review, dus diezelfde laag 'm laten opheffen maakt de rem een lus om zichzelf.
+          # Dezelfde grens die de gevoelige-paden-guard al trekt. Eigen melding i.p.v. hergebruik
+          # van die guard, want "raakt een gevoelig pad" zou hier een onware reden zijn.
+          #
+          # Deze helft (het label HONOREREN) landt bewust vóór de helft die 'm ZET: een rem die
+          # gezet wordt maar niet gehonoreerd, is stil kapot. Zelfde volgorde-discipline als bij
+          # een doctor-module en z'n pin.
+          if has 'review-blocker' && ! $approved; then
+            echo "Label review-blocker (I20) → mens-pad: de review vond een bewijsbare blocker."
+            echo "Alleen een expliciete approval van de owner heft dit op — een AI-approve of"
+            echo "plan-goedgekeurd volstaat hier niet. Weerlegd? Haal het label weg."
+            exit 0
+          fi
+
+          # PROVENANCE plan-goedgekeurd: honoreer het "gate één keer"-label alleen als een
+          # VERTROUWDE actor het zette — de eigenaar, of de bouw-bot (claude[bot]/github-actions[bot]/
+          # defleet-machinerie[bot], sinds de WORKFLOW_APP-secrets van 2026-07-14) die
+          # exact het in trap 2 goedgekeurde plan of een epic-fase bouwde. Zo kan een
+          # geïnjecteerde/gecompromitteerde agent (of een willekeurige actor met label-rechten) niet
+          # met één label de plan-poort omzeilen en zonder approval mergen. Herkomst uit de
+          # PR-timeline (het `labeled`-event van dit label).
+          plan_ok=false
+          if has 'plan-goedgekeurd'; then
+            labeler="$(gh api --paginate "repos/$REPO/issues/$NUM/timeline" \
+              -H 'Accept: application/vnd.github+json' 2>/dev/null \
+              | jq -rs '[.[][] | select(.event=="labeled" and .label.name=="plan-goedgekeurd") | .actor.login] | last // ""' \
+              2>/dev/null || true)"
+            case "$labeler" in
+              "$OWNER"|'claude[bot]'|'github-actions[bot]'|'defleet-machinerie[bot]')
+                plan_ok=true ;;
+              "")
+                echo "::warning::Kon herkomst van plan-goedgekeurd niet bepalen — niet als goedgekeurd plan behandeld." ;;
+              *)
+                echo "::warning::plan-goedgekeurd gezet door onvertrouwde actor '$labeler' — genegeerd (geen gate-één-keer)." ;;
+            esac
+          fi
+
+          # --- Gevoelige-paden-guard (epic #360 fase 3; verbreed door issue #570) ----------
+          # Was oorspronkelijk ALLEEN berekend voor auto-error-PR's (de autonomie-escalatie die
+          # auto-merge + release ZONDER menselijke poort toestaat, zie hieronder). Issue #570
+          # signaleerde dat een GEWONE fix/chore-PR die toevallig een gevoelig pad raakt (met
+          # name supabase/migrations/**) via de laatste `else`-tak hieronder ("kleine
+          # niet-breaking PR + groen → merge") op groene CI mergete ZONDER guard-check en ZONDER
+          # menselijke approval — dat botst met de lezing van constitution.md §Versoepeld dat een
+          # gevoelig pad altijd een mensgate forceert. We berekenen de guard daarom nu voor ÉLKE
+          # PR (niet alleen auto-error) en passen 'm hieronder toe op elke tak die anders zonder
+          # approval zou mergen (de kleine-PR-tak én de "gate één keer"-planroute).
+          sensitive=false; sensitive_reason=""
+          diff_file="$(mktemp)"
+          if gh pr diff "$NUM" --repo "$REPO" > "$diff_file" 2>/dev/null && [ -s "$diff_file" ]; then
+            # Leeg GITHUB_OUTPUT: we lezen de beslissing uit stdout, niet uit de step-output.
+            guard_out="$(GITHUB_OUTPUT='' bash scripts/sensitive-paths-guard.sh --diff "$diff_file" 2>&1 || true)"
+            echo "$guard_out"
+            if printf '%s' "$guard_out" | grep -q '^FORCE-APPROVAL:'; then
+              sensitive=true
+              sensitive_reason="$(printf '%s' "$guard_out" | sed -n 's/^FORCE-APPROVAL: //p' | head -1)"
+            elif ! printf '%s' "$guard_out" | grep -q '^CLEAN:'; then
+              # Guard gaf geen duidelijke uitspraak → FAIL-CLOSED: approval forceren.
+              sensitive=true; sensitive_reason="guard gaf geen duidelijke uitspraak (fail-closed)."
+            fi
+          else
+            # Kon de diff niet ophalen / lege diff → FAIL-CLOSED: niet volautonoom mergen.
+            sensitive=true; sensitive_reason="kon de PR-diff niet ophalen voor de guard (fail-closed)."
+          fi
+          rm -f "$diff_file"
+
+          # Is dit een `fix`-PR? (De auto-error-auto-release-escalatie geldt uitsluitend voor
+          # non-breaking fixes; een auto-error op een chore/docs volgt de normale kleine-PR-route.)
+          isfix=false
+          printf '%s' "$title" | grep -qiE '^fix(\([^)]+\))?:' && isfix=true
+
+          promote=false
+          if has 'auto-deps'; then
+            echo "auto-deps + groen → merge (geen release)."
+          elif $feat || $breaking; then
+            # Gate één keer: een niet-breaking feature met een in trap 2 goedgekeurd plan
+            # (label plan-goedgekeurd) mag mergen zonder tweede approval. Breaking changes en
+            # features zónder goedgekeurd plan blijven via jouw expliciete PR-approval.
+            if $breaking; then
+              if ! { $approved || $ai_approved; }; then
+                echo "Breaking change wacht op jouw approval of een APPROVED AI-review (ook mét plan)."; exit 0
+              fi
+              # Breaking op een gevoelig pad: AI-approve volstaat nooit, ook al is dit een
+              # breaking change — dezelfde harde grens als bij feature/kleine-PR hieronder.
+              if [ "$sensitive" = "true" ] && ! $approved; then
+                echo "Breaking change raakt een gevoelig pad → alleen jouw expliciete approval telt (AI-approve volstaat niet). $sensitive_reason"
+                echo "Wacht op jouw expliciete PR-approval."; exit 0
+              fi
+              if $approved; then echo "Breaking approved (owner) + groen → merge naar main."
+              else echo "Breaking approved (AI-review) + groen → merge naar main."; fi
+            elif $plan_ok; then
+              # Issue #570: "gate één keer" dekt de FEATURE-scope die de eigenaar in trap 2 goedkeurde —
+              # geen vrijbrief voor een gevoelig pad dat pas in de uitvoering opduikt (bv. een
+              # migratie die niet in het plan stond). Raakt de diff toch een gevoelig pad, dan
+              # valt dit terug op een expliciete PR-approval, net als de auto-error-tak hieronder.
+              if [ "$sensitive" = "true" ] && ! $approved; then
+                echo "Feature met goedgekeurd plan raakt een gevoelig pad → approval alsnog geforceerd (gate-één-keer dekt geen gevoelige paden). $sensitive_reason"
+                echo "Wacht op jouw expliciete PR-approval."; exit 0
+              fi
+              echo "Feature met goedgekeurd plan (gate één keer) + groen → merge naar main."
+            elif $approved || $ai_approved; then
+              # Zelfde gevoelige-paden-uitzondering als de plan_ok-tak hierboven: een AI-approve
+              # op een gevoelig pad volstaat nooit — alleen jouw eigen approval telt daar.
+              if [ "$sensitive" = "true" ] && ! $approved; then
+                echo "Feature raakt een gevoelig pad → alleen jouw expliciete approval telt (AI-approve volstaat niet). $sensitive_reason"
+                echo "Wacht op jouw expliciete PR-approval."; exit 0
+              fi
+              if $approved; then echo "Feature approved (owner) + groen → merge naar main."
+              else echo "Feature approved (AI-review) + groen → merge naar main."; fi
+            else
+              echo "Feature wacht op jouw plan-akkoord (label plan-goedgekeurd), jouw PR-approval, of een APPROVED AI-review."; exit 0
+            fi
+            # RELEASE NIET MEER AUTOMATISCH (issue #476): een feature/breaking-merge promoot
+            # `main → release` niet langer vanzelf — dat triggerde één dure gesignde-APK-build per
+            # feature. `promote` blijft `false`; de release trap je handmatig aan (Promote to
+            # release / label `release-nu` / kanban → "Released"). Het label `hold-release` is voor
+            # features daardoor een no-op (er is geen auto-release meer om te "houden"); het blijft
+            # wél gehonoreerd in de auto-error-tak hieronder.
+            echo "→ geen automatische release (issue #476): merge blijft op main tot je handmatig promoot."
+          elif has 'auto-error' && $isfix; then
+            # AUTONOMIE-ESCALATIE (epic #360 fase 3, vastgelegd in constitution.md §Versoepeld):
+            # een door de app auto-gerapporteerde fout wordt (na triage) een non-breaking `fix`-PR
+            # met label `auto-error`. Anders dan een gewone `fix` (die op main blijft wachten tot de
+            # volgende release) mag zo'n PR ZICHZELF mergen ÉN releasen — mits de gevoelige-paden-
+            # guard schoon is. Raakt de diff een gevoelig pad, dan valt 'ie terug op jouw approval.
+            if [ "$sensitive" = "true" ]; then
+              if ! $approved; then
+                echo "auto-error-fix raakt een gevoelig pad → approval geforceerd. $sensitive_reason"
+                echo "Wacht op jouw expliciete PR-approval (geen volautonome merge)."; exit 0
+              fi
+              echo "auto-error-fix op gevoelig pad, maar door jou approved + groen → merge naar main."
+            else
+              echo "auto-error-fix + guard-clean + groen → merge naar main + promote-release."
+            fi
+            has 'hold-release' && echo "hold-release → nu geen release (bundelen)." || promote=true
+          else
+            # Issue #570 (kernfix van dit issue): dit was de gate-loze route — elke andere
+            # kleine niet-breaking PR (fix/chore/docs/refactor/test/ci/perf/build/style, of een
+            # auto-error op zo'n type) mergete hier voorheen op groene CI zonder enige guard-
+            # check. Raakt de diff nu een gevoelig pad (SportBit/secrets/DB-migraties/nieuwe
+            # netwerk-bestemming — met name supabase/migrations/**), dan forceert de guard ook
+            # hier een menselijke approval i.p.v. volautonoom mergen.
+            if [ "$sensitive" = "true" ] && ! $approved; then
+              echo "Kleine PR raakt een gevoelig pad → approval geforceerd. $sensitive_reason"
+              echo "Wacht op jouw expliciete PR-approval (geen auto-merge zonder mensgate op dit pad)."; exit 0
+            fi
+            if [ "$sensitive" = "true" ]; then
+              echo "Kleine PR op gevoelig pad, maar door jou approved + groen → merge naar main."
+            else
+              echo "Kleine niet-breaking PR + groen → merge naar main (geen release)."
+            fi
+          fi
+
+          # --body expliciet meegeven: zonder deze vlag stelt gh de squash-commit samen uit de
+          # onderliggende commit-berichten (niet de PR-beschrijving), waardoor een "Fixes #N" dat
+          # alleen in de PR-body staat NOOIT in de gemergede commit terechtkomt — en GitHub sluit
+          # het gekoppelde issue dan niet automatisch. Dit hield epic-fasen en losse issues open
+          # ondanks een gemergede PR, en liet de epic-orchestrator (die op een GESLOTEN fase-issue
+          # wacht) stilvallen totdat iemand het issue handmatig sloot.
+          # IDEMPOTENTE MERGE. Ook al serialiseert de stabiele concurrency-key (zie boven) de
+          # workflow_run- en review-runs, blijft er een smal race-venster: twee runs kunnen net
+          # vóór elkaars state-check binnenkomen en allebei `gh pr merge` proberen. De verliezer
+          # krijgt dan een HTTP 405 / "not mergeable" / "already merged" — dat is GEEN echte fout
+          # maar simpelweg "de PR is al gemerged". Behandel het als succes: de gewenste eindtoestand
+          # (PR gemerged) is bereikt. Alleen een échte, niet-idempotente fout blokkeert.
+          if merge_out="$(gh pr merge "$NUM" --repo "$REPO" --squash --delete-branch --subject "$title" --body "$body" 2>&1)"; then
+            echo "$merge_out"
+          else
+            echo "$merge_out"
+            state_now="$(gh pr view "$NUM" --repo "$REPO" --json state --jq '.state' 2>/dev/null || echo '')"
+            if [ "$state_now" = "MERGED" ] \
+               || printf '%s' "$merge_out" | grep -qiE 'already[ _-]?merged|already been merged|not open|not in the correct state|405'; then
+              echo "PR #$NUM is al gemerged/gesloten door een parallelle run — idempotent succes, geen fout."
+              exit 0
+            fi
+            # Ruleset-weigering (required check net nog pending, of een approval-eis) is een
+            # WACHT-toestand, geen fout: het volgende check-/review-event triggert deze workflow
+            # opnieuw en maakt de merge alsnog af. Hard falen gaf hier alleen ruis (rode runs +
+            # gitflow-doctor-issues) zonder iets te repareren.
+            if printf '%s' "$merge_out" | grep -qiE 'base branch policy|not mergeable|review is required|approv'; then
+              echo "Ruleset/policy blokkeert de merge nu — wachten op het volgende check-/review-event."
+              exit 0
+            fi
+            echo "::error::pr merge faalde voor PR #$NUM (geen idempotente al-gemerged-toestand)."
+            exit 1
+          fi
+
+          # --- GESTAPELDE FASE — BASE-HERTARGET (epic #918 fase 3, issue #922) --------------
+          # Deze net-gemergede PR kan zelf de base-branch zijn van een nog-open, GESTAPELDE
+          # vervolg-PR (fase 2/#921: een epic-fase-PR branch't/base't op de vorige fase-branch
+          # zolang die nog open staat, zie claude.yml's "Bepaal stacked base-branch"-stap).
+          # `--delete-branch` hierboven verwijdert die head-branch als onderdeel van dezelfde
+          # `gh pr merge`-call. GitHub hertarget een open PR automatisch naar de base van DEZE
+          # PR (hier altijd "main", zie de `[ "$base" = "main" ]`-guard hierboven) zodra de
+          # branch waar die PR op base't wordt verwijderd — gedocumenteerd GitHub-gedrag
+          # ("pull request retargeting on branch deletion", github.blog/changelog/2022-08-08).
+          # We hebben dit (nog) niet empirisch getest tegen een levend gestapeld PR-paar in déze
+          # repo: fase 1 (#926) en fase 2 (#950) van epic #918 zijn allebei NIET gestapeld
+          # gemerged (fase 2 begon pas te bouwen nadat fase 1 al op main stond), dus een
+          # live-testcase deed zich tot nu toe niet voor. Borg het daarom expliciet i.p.v. blind
+          # op GitHub's automatiek te vertrouwen: controleer of een open PR nog steeds op de
+          # zojuist verwijderde branch base't, en zet 'm zo nodig met de hand op "main" — zodat
+          # het randgeval (automatische hertarget faalt/vertraagt/verandert van gedrag) de
+          # gestapelde stack niet stil laat vastlopen op een niet-bestaande base-branch.
+          head_branch="$(echo "$json" | jq -r '.headRefName // ""')"
+          if [ -n "$head_branch" ]; then
+            stacked_prs="$(gh pr list --repo "$REPO" --state open --base "$head_branch" \
+              --json number --jq '.[].number' 2>/dev/null || true)"
+            if [ -n "$stacked_prs" ]; then
+              for spr in $stacked_prs; do
+                cur_base=""
+                for attempt in 1 2 3; do
+                  cur_base="$(gh pr view "$spr" --repo "$REPO" --json baseRefName \
+                    --jq '.baseRefName' 2>/dev/null || echo "")"
+                  [ "$cur_base" != "$head_branch" ] && break
+                  sleep 3
+                done
+                if [ "$cur_base" = "$head_branch" ]; then
+                  echo "PR #$spr base't nog steeds op verwijderde branch '$head_branch' (GitHub's automatische hertarget bleef (nog) uit) — fallback: expliciet base=$base zetten."
+                  gh pr edit "$spr" --repo "$REPO" --base "$base" \
+                    || echo "::warning::Kon PR #$spr niet hertargeten naar $base — controleer/herstel handmatig."
+                else
+                  echo "PR #$spr staat al op base '$cur_base' — GitHub hertargette 'm automatisch bij de branch-delete, geen fallback nodig."
+                fi
+              done
+            fi
+          fi
+
+          # Deze merge draait op GITHUB_TOKEN, dus de resulterende push naar main triggert GEEN
+          # `on: push`-workflows (GitHub's anti-recursiebeleid) — met name pr-conflict-solver.yml
+          # zou anders nooit meer vanzelf ontdekken dat een andere open PR nu conflicteert met
+          # main. Zonder deze expliciete dispatch bleef zo'n PR voor altijd "dirty" liggen totdat
+          # iemand het toevallig handmatig triggerde (zichtbaar op PR #126: alle checks groen,
+          # maar mergeable_state=dirty, en pr-conflict-solver had al sinds de vorige hándmatige
+          # merge niet meer gedraaid). workflow_dispatch is de cascade-uitzondering die wél vanaf
+          # GITHUB_TOKEN start — zelfde patroon als epic-orchestrator.yml/issue-triage.yml.
+          gh workflow run pr-conflict-solver.yml --repo "$REPO" --ref main \
+            || echo "::warning::Kon pr-conflict-solver niet dispatchen — conflicten lossen zichzelf niet op tot de volgende handmatige merge of dispatch."
+
+          # EPIC — direct doorbouwen i.p.v. wachten op de schedule. Sluit deze merge een
+          # epic-fase-issue (via "Fixes #N"/"Closes #N"), dan wacht de epic-orchestrator anders
+          # tot de eerstvolgende cron-tik (2×/dag) voordat de volgende fase oppikt — bij een
+          # epic-akkoord vlak na een schedule-run kan dat bijna 12 uur stilstand betekenen. Dezelfde
+          # anti-recursie-reden als hierboven bij pr-conflict-solver: deze merge draait op
+          # GITHUB_TOKEN, dus het issue-close-event triggert epic-orchestrator.yml's
+          # `issues: closed`-listener niet vanzelf. workflow_dispatch is de cascade-uitzondering.
+          closed_issue="$(printf '%s\n%s' "$title" "$body" \
+            | grep -oiE '(close[sd]?|fix(e[sd])?|resolve[sd]?)[[:space:]]+#[0-9]+' \
+            | grep -oE '[0-9]+' | tail -1 || true)"
+          if [ -n "${closed_issue:-}" ]; then
+            issue_labels="$(gh issue view "$closed_issue" --repo "$REPO" --json labels --jq '.labels[].name' 2>/dev/null || true)"
+            if printf '%s\n' "$issue_labels" | grep -qx 'epic-fase'; then
+              echo "PR #$NUM sluit epic-fase #$closed_issue → epic-orchestrator direct dispatchen."
+              gh workflow run epic-orchestrator.yml --repo "$REPO" --ref main \
+                || echo "::warning::Kon epic-orchestrator niet dispatchen — de volgende fase wacht dan op de eerstvolgende schedule-run."
+            fi
+          fi
+
+          if [ "$promote" = true ]; then
+            echo "→ promoot main → release (gebundelde APK)."
+            gh workflow run promote-release.yml --repo "$REPO" --ref main \
+              -f reason="auto: feature PR #$NUM approved" \
+              || echo "::warning::Kon promote-release niet starten — promoot desnoods handmatig."
+          fi

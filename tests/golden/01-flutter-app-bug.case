@@ -1,0 +1,10 @@
+titel: Voorraadlijst in de app crasht bij een leeg item
+verwacht: transfer KCTHolman/BiohackOS
+---
+## Doel
+De voorraad-lijst in de flutter-app klapt eruit zodra een item geen datum heeft.
+Na deze wijziging toont hij dat item gewoon onderaan zonder te crashen.
+
+## Acceptatiecriteria
+- [ ] Een item zonder datum verschijnt in de lijst in plaats van een crash
+- [ ] Er is een test die precies dat geval afdekt

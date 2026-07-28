@@ -1,0 +1,76 @@
+# routing.yml — welk idee hoort bij welk project?
+#
+# De routeringstabel van de poort (docs/architectuur.md §3b). Bewust een DOM bestand: trefwoorden,
+# geen model. De poort mag nooit gokken — bij twijfel is `needs-routing` het juiste antwoord, want
+# een verkeerd geplaatst issue kost meer dan een seconde extra van de eigenaar.
+#
+# Matchregel (zie scripts/intake-decide.sh): elk trefwoord dat als HEEL WOORD in titel of body
+# voorkomt telt één punt voor z'n consument. De consument met strikt de meeste punten wint. Bij
+# gelijkspel of nul punten → `needs-routing`.
+#
+# Onderhoud: voeg een trefwoord toe zodra je een issue ziet dat verkeerd (of niet) routeerde.
+# Dit bestand is de enige plek waar projectkennis in de poort zit — houd 'm daarom kort en
+# onderscheidend: woorden die bij MEERDERE consumenten passen horen hier niet (die maken de
+# routering juist onscherp).
+#
+# SHOWCASE-NOOT: de trefwoordenlijst van de productconsument is hier bewust generiek gehouden.
+# In een echte opstelling staan hier de domeinwoorden van jouw project; dat is precies de reden
+# dat dit bestand de énige plek is waar projectkennis in de poort zit — zo blijft de rest van de
+# machinerie domeinvrij en deelbaar.
+
+version: 1
+
+consumers:
+  - repo: KCTHolman/BiohackOS
+    name: BiohackOS
+    beschrijving: de productconsument (Flutter + web + Supabase)
+    keywords:
+      # toolchain/platform
+      - flutter
+      - dart
+      - riverpod
+      - supabase
+      - android
+      - apk
+      # domein
+      - app
+      - dashboard
+      - catalogus
+      - bestelling
+      - voorraad
+      - rapport
+      - export
+      - notificatie
+      - profiel
+
+  - repo: KCTHolman/fleet
+    name: deFleet
+    beschrijving: de pijplijn zelf — workflows, runners, gitflow
+    keywords:
+      - workflow
+      - workflows
+      - runner
+      - runners
+      - lane
+      - lanes
+      - gitflow
+      - pijplijn
+      - pipeline
+      - fleet
+      - defleet
+      - intake
+      - poort
+      - doctor
+      - invariant
+      - invarianten
+      - auto-merge
+      - automerge
+      - watchdog
+      - reconciler
+      - orchestrator
+      - canary
+      - actions
+      - caller
+      - callers
+
+# Geen `default:`. Dat is opzet: er bestaat geen "gooi het maar ergens heen"-uitkomst.

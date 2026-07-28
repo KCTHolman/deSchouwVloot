@@ -1,0 +1,186 @@
+name: "[fleet] pick-runner"
+# Reusable workflow: bepaalt op welke runner een zware Claude-job draait.
+# Fase 1 leverde het fundament (altijd ubuntu-latest); deze versie (fase "availability-check",
+# epic #636) bevraagt de GitHub runners-API en routeert écht naar de self-hosted runner als
+# die online is. Zie het interne draaiboek §2/§3 voor het contract.
+
+on:
+  workflow_call:
+    inputs:
+      runner_label:
+        type: string
+        # Verplicht sinds de lane-migratie: er is geen default-lane meer (runner-lanes-bouwplan
+        # §3/§5 verving de oude gedeelde runner door biohack-agent/-heavy/-light). Een caller
+        # die 'm vergat kreeg dus een label dat geen enkele runner draagt — en omdat de pick-job
+        # inmiddels zélf op dat label draait, betekende dat een job die oneindig queue't i.p.v.
+        # luid faalt. `required: true` maakt die vergissing een parse-fout bij de eerste run.
+        # Alle 31 aanroepers geven al expliciet een lane mee (12 agent / 3 heavy / 16 light).
+        required: true
+        description: >
+          Lane-label van de self-hosted runner om te zoeken: `biohack-agent` (1 slot),
+          `biohack-heavy` (2) of `biohack-light` (2). Zie de routeringstabel in
+          het interne draaiboek §1.
+      fallback_label:
+        type: string
+        required: false
+        default: ubuntu-latest
+        description: Runner om op terug te vallen als de self-hosted runner niet bruikbaar is.
+      trusted_context_only:
+        type: boolean
+        required: false
+        default: true
+        description: If true, only use self-hosted runner from main branch
+      picker_runner:
+        type: string
+        required: false
+        default: biohack-light
+        description: >
+          Runner waarop DEZE beslis-job zelf draait — niet te verwarren met `runner_label`, dat de
+          lane voor het echte werk erna kiest.
+
+          WAAROM DIT EEN INPUT WERD (2026-07-28). Deze waarde stond hardcoded op `biohack-light`,
+          met "stilval is voor nu geaccepteerd" als notitie. Voor BiohackOS is dat een bewuste
+          kosten-keuze; voor een consument zonder self-hosted host-toegang is het een eeuwige queue. Precies
+          dat gebeurde bij InvestingOS: run 30336854107 (`cleanup / pick / pick`, labels=biohack-light)
+          hing na een gemergede PR onbeperkt, omdat runners op een persoonlijk account repo-scoped
+          zijn. Een bootstrap-job die beslist wélke runner je gebruikt, mag zelf nooit een runner
+          eisen die de consument misschien niet heeft.
+
+          De default is bewust ONGEWIJZIGD `biohack-light`, zodat het gedrag van alle 38 bestaande
+          aanroepers byte-voor-byte gelijk blijft. Een consument zonder self-hosted lanes geeft
+          `ubuntu-latest` mee. In fase 3 verhuist deze keuze naar `.fleet.yml` (architectuur.md
+          §fase-3 / regel 220) en vervalt de input-per-caller.
+
+          ZET DIT NOOIT GELIJK AAN EEN AGENT-LANE. De availability-check hieronder telt alleen
+          runners met `busy == false`; draait de picker op de lane die 'ie zélf opmeet, dan bezet
+          'ie een slot en meet 'm er één te weinig. Op de 1-slot agent-lane is dat geen randgeval
+          maar een zekerheid — zie de uitleg bij `runs-on` hieronder (#1226).
+    secrets:
+      RUNNER_CHECK_TOKEN:
+        required: false
+        description: >
+          Fine-grained PAT met alleen Administration:Read-only op deze repo, nodig om de
+          runners-API te bevragen. Ontbreekt 'ie, dan valt de output altijd terug op
+          fallback_label — er is geen moment waarop dit stilzwijgend anders faalt.
+    outputs:
+      runner:
+        value: ${{ jobs.pick.outputs.runner }}
+        description: The selected runner (runner_label of fallback_label)
+
+jobs:
+  pick:
+    # Tijdelijk (2026-07, credits op): de pick-job zelf draait op de self-hosted runner
+    # i.p.v. ubuntu-latest, want elke aanroep hiervan (~30 workflows) kostte GitHub-hosted
+    # minuten, los van welke runner de zware job daarna kreeg. Is de lichte lane offline,
+    # dan blijft deze job wachten (stilval is voor BiohackOS geaccepteerd).
+    # Volgende maand (credits terug): zet terug naar ubuntu-latest met self-hosted als
+    # opt-in, of geef deze job zelf ook een fallback via availability-check.
+    #
+    # SINDS 2026-07-28 EEN INPUT, GEEN CONSTANTE. De default is nog steeds `biohack-light`, dus
+    # voor BiohackOS verandert er niets; een consument zónder self-hosted host-toegang geeft
+    # `ubuntu-latest` mee en hangt niet meer eeuwig in de wachtrij (InvestingOS, run
+    # 30336854107). Zie de uitleg bij `inputs.picker_runner` hierboven.
+    #
+    # LET OP — NIET op `inputs.runner_label` zetten (#1226 deed dat wel).
+    # De availability-check hieronder telt alleen runners met `busy == false`. Draait de
+    # picker op de lane die 'ie zélf opvraagt, dan maakt 'ie die lane busy en meet 'm één
+    # slot te weinig. Voor de 1-slot agent-lane is dat geen randgeval maar een zekerheid:
+    # de picker bezet het enige slot, ziet 0 vrije runners, en valt ALTIJD terug op
+    # ubuntu-latest — precies de betaalde minuten die #1226 wilde besparen, voor alle 12
+    # agent-callers. De lichte lane heeft 2 slots, dus de picker houdt daar altijd een
+    # vrij slot over om over te rapporteren; en de picker is per definitie licht werk
+    # (één curl + jq), dus dat is ook waar 'ie hoort (bouwplan §1).
+    runs-on: ${{ inputs.picker_runner }}
+    permissions:
+      contents: read
+    outputs:
+      runner: ${{ steps.decide.outputs.runner }}
+    steps:
+      - name: Determine context
+        id: context
+        run: |
+          # Trusted context: main branch, push event (automatic workflows), of expliciete
+          # workflow_dispatch. Untrusted context: PR heads, any external trigger.
+          IS_TRUSTED=${{ (github.ref == 'refs/heads/main' && github.event_name == 'push') || github.event_name == 'workflow_dispatch' }}
+
+          echo "is_trusted=${IS_TRUSTED}" >> "$GITHUB_OUTPUT"
+
+      - name: Beschikbaarheid self-hosted runner opvragen
+        id: availability
+        # Alleen de moeite waard om te bevragen in trusted context — untrusted context
+        # gebruikt toch altijd fallback_label (zie volgende stap), dus geen API-call nodig.
+        if: >
+          inputs.trusted_context_only != true ||
+          steps.context.outputs.is_trusted == 'true'
+        env:
+          RUNNER_CHECK_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN }}
+          LABEL: ${{ inputs.runner_label }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${RUNNER_CHECK_TOKEN:-}" ]; then
+            echo "online=false" >> "$GITHUB_OUTPUT"
+            echo "reason=RUNNER_CHECK_TOKEN-secret ontbreekt" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          http_code=$(curl -s -o /tmp/runners.json -w "%{http_code}" \
+            --connect-timeout 5 --max-time 10 \
+            -H "Authorization: Bearer ${RUNNER_CHECK_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/${REPO}/actions/runners?per_page=100")
+
+          if [ "$http_code" -ge 400 ]; then
+            echo "online=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Runners-API gaf HTTP ${http_code}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Beschikbaar = status "online", NIET busy, én het gevraagde label erop. Busy telt sinds
+          # epic #985 fase 3 NIET meer mee: de self-hosted registraties (lanes agent/heavy/light)
+          # delen hun home-map en dus hun agent-sessie. Een tweede job op een
+          # al-bezette registratie botst op die ene sessie en sterft op turn 1 (#776/#778). "Busy"
+          # als "beschikbaar" tellen trok die stapeling juist aan. Is elke registratie busy of
+          # offline, dan valt de volgende stap terug op fallback_label (ubuntu-latest) i.p.v. de job
+          # onzichtbaar op de bezette self-hosted pool te laten wachten.
+          # LET OP — deze jq-filter is 1-op-1 getest in scripts/pick-runner-available.test.sh
+          # (busy-fixture). Wijzig je 'm hier, pas de gespiegelde filter in die test mee aan.
+          match=$(jq -r --arg label "$LABEL" \
+            '[.runners[]? | select(.status == "online") | select(.busy == false) | select([.labels[]?.name] | index($label) != null)] | length' \
+            /tmp/runners.json)
+
+          if [ "$match" -gt 0 ]; then
+            echo "online=true" >> "$GITHUB_OUTPUT"
+            echo "reason=Runner met label '${LABEL}' is online" >> "$GITHUB_OUTPUT"
+          else
+            echo "online=false" >> "$GITHUB_OUTPUT"
+            echo "reason=Geen online runner met label '${LABEL}'" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pick runner
+        id: decide
+        env:
+          TRUSTED_ONLY: ${{ inputs.trusted_context_only }}
+          IS_TRUSTED: ${{ steps.context.outputs.is_trusted }}
+          ONLINE: ${{ steps.availability.outputs.online }}
+          REASON: ${{ steps.availability.outputs.reason }}
+          RUNNER_LABEL: ${{ inputs.runner_label }}
+          FALLBACK_LABEL: ${{ inputs.fallback_label }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TRUSTED_ONLY" = "true" ] && [ "$IS_TRUSTED" != "true" ]; then
+            runner="$FALLBACK_LABEL"
+            reason="Untrusted context (PR of ander event) — fallback voor security"
+          elif [ "$ONLINE" = "true" ]; then
+            runner="$RUNNER_LABEL"
+            reason="$REASON"
+          else
+            runner="$FALLBACK_LABEL"
+            reason="${REASON:-self-hosted runner niet beschikbaar}"
+          fi
+
+          echo "runner=${runner}" >> "$GITHUB_OUTPUT"
+          echo "→ Selected runner: ${runner} (${reason})"

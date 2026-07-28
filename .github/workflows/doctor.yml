@@ -1,0 +1,188 @@
+name: "[fleet] Fleet-doctor"
+
+# De invariantenbewaker uit docs/gitflow.md §11. HARD RAPPORTEREN, NOOIT MUTEREN — mutaties horen
+# bij de watchdog (repo-scope) of de eigenaar (host/settings).
+#
+# Draait als reusable workflow in de context van de AANROEPER, dus 'ie checkt de repo van de
+# consument met diens eigen runners en variabelen. De logica zelf staat in scripts/fleet-doctor.sh
+# (offline getest door fleet-doctor.test.sh); deze workflow haalt alleen de twee checkouts op en
+# voert uit.
+#
+# WAAROM TWEE CHECKOUTS. `actions/checkout` pakt in een reusable workflow standaard de AANROEPER —
+# precies wat de consistentie-module moet lezen. Het doctorscript zelf woont hier, dus dat is een
+# tweede, expliciete checkout van deze repo in een submap.
+
+on:
+  workflow_call:
+    inputs:
+      modules:
+        type: string
+        required: false
+        default: consistentie
+        description: >
+          Komma-lijst van modules: `consistentie` (I1/I2/I5/I7, bestandsgebaseerd),
+          `permissies` (I26), `contract` (.fleet.yml), `spine` (I25, workflow-states),
+          `runners` (I10/I11, override + lane-beschikbaarheid) en/of `liveness` (I27).
+          `liveness` meet GEDRAG in plaats van configuratie: liep de bron, en reageerde de
+          luisteraar? Dat is de enige module die stille non-actie ziet — de faalklasse die op
+          2026-07-27 de complete spine tien uur platlegde terwijl elke andere check groen bleef.
+      runner:
+        type: string
+        required: false
+        default: ubuntu-latest
+        description: >
+          Runner om op te draaien. De doctor is secondenwerk en heeft geen toolchain nodig;
+          een consument met een lichte lane kan die meegeven om GitHub-minuten te sparen.
+      fleet_ref:
+        type: string
+        required: false
+        default: main
+        description: Ref van deze repo waaruit het doctorscript komt. Volgt het pin-beleid van de aanroeper.
+      spine:
+        type: string
+        required: false
+        default: auto-merge.yml,pr-check.yml,epic-orchestrator.yml,reconciler-cron.yml
+        description: Workflow-bestanden die als spine gelden voor I25 (per consument anders).
+    secrets:
+      RUNNER_CHECK_TOKEN:
+        required: false
+        description: >
+          Fine-grained PAT met Administration:Read, nodig om de runners-API te bevragen (I11).
+          Ontbreekt 'ie, dan slaat de runners-module over met een ⚠️ — nooit stilzwijgend anders.
+      APP_ID:
+        required: false
+        description: >
+          App-ID van de machinerie-identiteit (`defleet-machinerie`). Nodig om deze PRIVÉ-repo
+          uit te checken voor het doctorscript — de `GITHUB_TOKEN` van de aanroeper heeft daar
+          geen toegang toe. Dat `uses:` de workflow zelf ophaalt zegt niets over de runner:
+          geverifieerd 2026-07-28, run 30312016777 faalde met "Repository not found".
+      APP_PRIVATE_KEY:
+        required: false
+        description: Private key bij APP_ID. Zie `WORKFLOW_APP_PRIVATE_KEY` voor de oude naam.
+      WORKFLOW_APP_ID:
+        required: false
+        description: Alternatieve naam voor APP_ID (BiohackOS gebruikt deze sinds 2026-07-14).
+      WORKFLOW_APP_PRIVATE_KEY:
+        required: false
+        description: Alternatieve naam voor APP_PRIVATE_KEY.
+
+permissions:
+  contents: read
+  actions: read   # workflow-states voor I25
+
+jobs:
+  doctor:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Aanroeper uitchecken
+        uses: actions/checkout@v7
+
+      # De fleet-repo is PRIVÉ en de GITHUB_TOKEN van de aanroeper heeft daar geen toegang toe.
+      # Dat `uses:` de workflowdefinitie ophaalt is een server-side mechanisme en zegt niets over
+      # wat de runner mag klonen — geverifieerd 2026-07-28 (run 30312016777: "Repository not
+      # found"). De machinerie-identiteit is hier het juiste antwoord: de app is op beide repo's
+      # geïnstalleerd, dus één token dekt precies deze beweging.
+      #
+      # Twee namenparen omdat de consumenten historisch verschillen (BiohackOS zette
+      # `WORKFLOW_APP_*` op 2026-07-14, fleet gebruikt `APP_*`). Een ontbrekend secret is bij
+      # `secrets: inherit` een lege string, dus de `||`-val werkt.
+      - name: App-token munten (leestoegang tot de fleet-repo)
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID || secrets.WORKFLOW_APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.WORKFLOW_APP_PRIVATE_KEY }}
+          owner: KCTHolman
+          repositories: fleet
+
+      - name: Doctorscript ophalen
+        uses: actions/checkout@v7
+        with:
+          repository: KCTHolman/fleet
+          ref: ${{ inputs.fleet_ref }}
+          path: .fleet-doctor
+          token: ${{ steps.app.outputs.token }}
+          # Geen credentials laten staan in de submap: het doctorscript hoeft niets te pushen,
+          # en een blijvend token in een checkout is precies wat least-secrets verbiedt.
+          persist-credentials: false
+
+      - name: Invarianten draaien
+        # EXPLICIET GEEN `-e`. GitHub's bash-default is `-eo pipefail`, en een eigen
+        # `set -uo pipefail` zet die `-e` NIET uit. Gevolg (geverifieerd, run 30312150082): de
+        # step stierf op de eerste module met een bevinding, dus `runners` draaide nooit en het
+        # eindoordeel werd nooit geprint. Een doctor die stopt bij z'n eerste vondst verbergt de
+        # rest — precies het tegenovergestelde van waarvoor 'ie bestaat. Zelfde reden en zelfde
+        # oplossing als in host-diagnostics.yml van de consument.
+        shell: bash --noprofile --norc {0}
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+          MODULES: ${{ inputs.modules }}
+          SPINE: ${{ inputs.spine }}
+          HAS_RUNNER_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN != '' }}
+        run: |
+          set -uo pipefail
+          rc=0
+          gedraaid=0
+          overgeslagen=0
+          out() { tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          printf '# Fleet-doctor — %s\n\n' "$REPO" | out
+
+          IFS=',' read -ra mods <<< "$MODULES"
+          for m in "${mods[@]}"; do
+            m="$(printf '%s' "$m" | tr -d ' ')"
+            [ -n "$m" ] || continue
+
+            if [ "$m" = "runners" ] && [ "$HAS_RUNNER_TOKEN" != "true" ]; then
+              printf '⚠️  module `runners` overgeslagen: RUNNER_CHECK_TOKEN ontbreekt (I11 ongetoetst).\n\n' | out
+              overgeslagen=$((overgeslagen + 1))
+              continue
+            fi
+
+            # PIN-SCHEEFSTAND IS GEEN TYPEFOUT. Vraag eerst wat DEZE fleet-versie kent. Consumenten
+            # staan op een SHA (I24); zet een caller een module aan die pas in een nieuwere fleet
+            # bestaat, dan is dat geen fout van de consument maar een pin die moet opschuiven.
+            # Zonder dit onderscheid gaf dat hard rood met een melding die naar een typefout wees —
+            # en van binnenuit zien die twee er identiek uit.
+            if [ -z "${BEKEND:-}" ]; then
+              BEKEND="$(bash .fleet-doctor/scripts/fleet-doctor.sh --module modules 2>/dev/null || true)"
+            fi
+            if [ -n "$BEKEND" ] && ! printf '%s\n' "$BEKEND" | grep -qxF "$m"; then
+              printf '⚠️  module `%s` overgeslagen: deze fleet-pin kent hem nog niet (bekend: %s). Schuif de pin door, of haal de module uit de caller.\n\n' \
+                "$m" "$(printf '%s' "$BEKEND" | tr '\n' ' ')" | out
+              overgeslagen=$((overgeslagen + 1))
+              continue
+            fi
+
+            printf '```\n' | out
+            case "$m" in
+              consistentie) bash .fleet-doctor/scripts/fleet-doctor.sh --module consistentie --root . 2>&1 | out ;;
+              spine)        bash .fleet-doctor/scripts/fleet-doctor.sh --module spine --repo "$REPO" --spine "$SPINE" 2>&1 | out ;;
+              runners)      bash .fleet-doctor/scripts/fleet-doctor.sh --module runners --repo "$REPO" 2>&1 | out ;;
+              permissies)   bash .fleet-doctor/scripts/fleet-doctor.sh --module permissies --root . 2>&1 | out ;;
+              contract)     bash .fleet-doctor/scripts/fleet-doctor.sh --module contract --root . 2>&1 | out ;;
+              liveness)     bash .fleet-doctor/scripts/fleet-doctor.sh --module liveness --repo "$REPO" 2>&1 | out ;;
+              *)            printf '::error::onbekende module %s\n' "$m"; rc=1 ;;
+            esac
+            # ${PIPESTATUS[0]} = het script, niet de tee erachter.
+            [ "${PIPESTATUS[0]}" -ne 0 ] && rc=1
+            gedraaid=$((gedraaid + 1))
+            printf '```\n\n' | out
+          done
+
+          # Draaide er NIETS terwijl er wel iets gevraagd was, dan is "geen bevindingen" een leugen.
+          # Zo komt een typefout in de enige gevraagde module alsnog hard naar boven, en blijft de
+          # zachte behandeling hierboven beperkt tot het geval waarvoor 'ie bedoeld is.
+          if [ "$gedraaid" = 0 ] && [ "$overgeslagen" -gt 0 ]; then
+            printf '::error::geen enkele gevraagde module kon draaien (%d overgeslagen) — dit is geen groen resultaat\n' "$overgeslagen"
+            rc=1
+          fi
+
+          if [ "$rc" -ne 0 ]; then
+            printf '❌ **Er zijn harde bevindingen.** Zie de ❌-regels hierboven; de invarianten staan in `docs/gitflow.md §11`.\n' | out
+          else
+            printf '✅ **Geen harde bevindingen.**\n' | out
+          fi
+          exit "$rc"
