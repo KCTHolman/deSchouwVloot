@@ -10,6 +10,7 @@
 #   scripts/fleet-doctor.sh --module spine        --repo <owner/naam> [--spine "a.yml,b.yml"]
 #   scripts/fleet-doctor.sh --module runners      --repo <owner/naam>
 #   scripts/fleet-doctor.sh --module liveness     --repo <owner/naam> [--grace-min 30]
+#   scripts/fleet-doctor.sh --module afhankelijkheden --root . --fleet-root <checkout van deze repo>
 #
 # `consistentie` is puur bestandsgebaseerd → offline testbaar (fleet-doctor.test.sh). `spine`,
 # `runners` en `liveness` bevragen de GitHub-API en hebben `gh` + GH_TOKEN nodig; van `liveness`
@@ -25,6 +26,7 @@ module=""
 root="."
 repo=""
 fleet_repo="KCTHolman/fleet"
+fleet_root=""
 spine_list="auto-merge.yml,pr-check.yml,epic-orchestrator.yml,reconciler-cron.yml"
 # Speling tussen "de bron is klaar" en "de luisteraar is begonnen". Ruim genoeg dat een run die
 # NET voltooide geen vals alarm geeft, krap genoeg dat een dode trigger binnen het uur opvalt.
@@ -40,6 +42,10 @@ while [ $# -gt 0 ]; do
     --fleet-repo) shift; fleet_repo="${1:-}" ;;
     --spine)      shift; spine_list="${1:-}" ;;
     --grace-min)  shift; grace_min="${1:-}" ;;
+    # Pad naar een checkout van DEZE repo naast die van de consument. I28 leest de eis uit de
+    # stationsdefinities zelf, zodat er geen handmatige lijst is die achterloopt. In doctor.yml
+    # staat die checkout al klaar als `.fleet-doctor`.
+    --fleet-root) shift; fleet_root="${1:-}" ;;
     *) die "onbekend argument: $1" ;;
   esac
   shift
@@ -231,6 +237,74 @@ module_spine() {
     fi
   done
   [ "$hard" = 0 ] && [ "$found" -gt 0 ] && ok "I25: alle $found gecontroleerde spine-workflows staan actief"
+}
+
+# ---------------------------------------------------------------------------------------------
+# MODULE afhankelijkheden — I28. Roept een station een script aan dat de consument niet heeft?
+# ---------------------------------------------------------------------------------------------
+#
+# Een station draait in de werkmap van de CONSUMENT. Roept het daar `scripts/foo.sh` aan, dan is
+# dat een harde eis aan die consument — maar nergens staat opgeschreven dát het een eis is. Met
+# één consument valt dat nooit op, want daar staat het script gewoon.
+#
+# Gemeten 2026-07-28 bij het aanhaken van een tweede consument: `auto-merge` roept
+# `scripts/sensitive-paths-guard.sh` aan en dat bestaat daar niet. Het gedrag is netjes
+# fail-closed (elke PR wacht dan op een mens), en juist DAAROM is het gevaarlijk: er wordt niets
+# rood, de spine "werkt", en niemand merkt dat 'ie per constructie nooit meer merget.
+#
+# Zelfde faalvorm die I23 bij de golden-set afkeurde en die I27 bij triggers vangt: een uitkomst
+# die altijd hetzelfde is, ziet er van buiten uit als een werkende check. Zie het kopje
+# "Groen is geen bewijs" in README.md — dit is het derde bewijspunt van dat patroon.
+#
+# Deze module leest de eis uit de stationsdefinitie zelf (dus geen handmatig bijgehouden lijst die
+# achterloopt) en toetst 'm tegen de consument. Vereist een checkout van deze repo naast die van
+# de consument — in doctor.yml staat die in `.fleet-doctor`.
+module_afhankelijkheden() {
+  [ -d "$wf_dir" ] || { warn "geen $wf_dir — niets te controleren"; return; }
+  if [ -z "$fleet_root" ] || [ ! -d "$fleet_root/.github/workflows" ]; then
+    warn "I28: geen checkout meegegeven (--fleet-root) — afhankelijkheden ongetoetst"
+    return
+  fi
+
+  # De verwijzing die we zoeken is `<fleet_repo>/.github/workflows/<station>.yml@<ref>`. Bewust
+  # via $fleet_repo (dezelfde vlag die I24 al gebruikt) en NIET hardgecodeerd: deze logica wordt
+  # onder meer dan één repo-naam aangeroepen, en een hardgecodeerde naam laat de module
+  # stilzwijgend niets vinden en dus altijd ✅ melden — precies de faalvorm die I28 zelf aan de
+  # kaak stelt. Punten in een repo-naam escapen, anders zijn het regex-jokers.
+  local repo_re refs
+  repo_re="$(printf '%s' "$fleet_repo" | sed 's/[.[\*^$]/\\&/g')"
+  refs="$(grep -rhoE "$repo_re/\.github/workflows/[A-Za-z0-9_.-]+\.yml@" "$wf_dir" 2>/dev/null \
+    | sed -E 's|.*/||; s|@$||' | sort -u)"
+  if [ -z "$refs" ]; then
+    ok "I28: deze repo roept geen stations van $fleet_repo aan"
+    return
+  fi
+
+  local getoetst=0 i28=0 station nodig s
+  while IFS= read -r station; do
+    [ -n "$station" ] || continue
+    [ -f "$fleet_root/.github/workflows/$station" ] || continue
+    # `bash scripts/x.sh` met een SPATIE ervoor: zo vallen `.fleet-doctor/scripts/...` en
+    # `.fleet-lib/scripts/...` er automatisch buiten — dat zijn onze eigen checkouts in de
+    # werkmap van de consument, geen eis aan de consument.
+    nodig="$(grep -ohE '(bash|sh) scripts/[A-Za-z0-9_.-]+\.sh' "$fleet_root/.github/workflows/$station" 2>/dev/null \
+      | sed -E 's/^(bash|sh) //' | sort -u)"
+    [ -n "$nodig" ] || continue
+    getoetst=$((getoetst + 1))
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      if [ ! -f "$root/$s" ]; then
+        bad "I28: station $station roept \`$s\` aan in deze repo, maar dat bestand bestaat hier niet — het station draait dan op z'n faalpad zonder dat iets rood wordt"
+        i28=1
+      fi
+    done <<< "$nodig"
+  done <<< "$refs"
+
+  if [ "$getoetst" = 0 ]; then
+    ok "I28: geen van de aangeroepen stations eist een script uit deze repo"
+  elif [ "$i28" = 0 ]; then
+    ok "I28: alle scripts die de $getoetst aangeroepen stations nodig hebben, staan er"
+  fi
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -433,7 +507,8 @@ permissies
 spine
 runners
 contract
-liveness"
+liveness
+afhankelijkheden"
 
 case "$module" in
   consistentie) echo "── fleet-doctor · consistentie (I1/I2/I5/I7) ──"; module_consistentie ;;
@@ -442,6 +517,7 @@ case "$module" in
   runners)      echo "── fleet-doctor · runners (I10/I11) ──";          module_runners ;;
   contract)     echo "── fleet-doctor · contract (.fleet.yml) ──";      module_contract ;;
   liveness)     echo "── fleet-doctor · liveness (I27) ──";             module_liveness ;;
+  afhankelijkheden) echo "── fleet-doctor · afhankelijkheden (I28) ──";  module_afhankelijkheden ;;
   # Verborgen haak: laat de test de PURE beslisser aanroepen zonder netwerk of klok.
   #   --module liveness-oordeel --repo "<bron_epoch> <luisteraar_epoch> <grace_sec>"
   liveness-oordeel) liveness_oordeel $repo ;;

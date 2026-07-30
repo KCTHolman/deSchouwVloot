@@ -231,6 +231,68 @@ else
   bad "verse luisteraar verkeerd gerapporteerd (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
 fi
 
+echo "fleet-doctor · I28 (consument-side afhankelijkheden van een station):"
+
+# Een station draait in de werkmap van de CONSUMENT. Roept het daar `scripts/foo.sh` aan, dan is
+# dat een harde eis aan die consument die nergens als eis opgeschreven staat. Met één consument
+# valt dat nooit op. Gemeten 2026-07-28: `auto-merge` eist `scripts/sensitive-paths-guard.sh`, en
+# een tweede consument heeft dat niet — het station zou daar netjes fail-closed draaien en dus
+# NOOIT mergen, zonder dat er iets rood wordt. Een station dat per constructie altijd hetzelfde
+# antwoord geeft, ziet er van buiten uit als een werkende check.
+mkrepo "$T/i28fleet" 1
+printf 'name: "[fleet] station"\non:\n  workflow_call: {}\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/nodig.sh --diff d\n' > "$T/i28fleet/.github/workflows/station.yml"
+
+mkrepo "$T/i28mis" 0
+printf 'name: caller\non:\n  pull_request: {}\njobs:\n  c:\n    uses: KCTHolman/fleet/.github/workflows/station.yml@main\n' > "$T/i28mis/.github/workflows/c.yml"
+
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28mis" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
+if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "I28"; then
+  ok "station eist een script dat de consument mist => harde bevinding"
+else
+  bad "ontbrekend consument-script niet gevangen (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+mkdir -p "$T/i28mis/scripts"; : > "$T/i28mis/scripts/nodig.sh"
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28mis" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
+if [ "$rc" = 0 ]; then ok "script aanwezig => schoon"; else bad "vals-positief (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'; fi
+
+# De checkout van het station zelf (`.fleet-doctor/scripts/...`) is GEEN eis aan de consument.
+# Zonder die uitzondering zou elke doctor-caller vals alarm geven.
+mkrepo "$T/i28eigen" 1
+printf 'name: "[fleet] d"\non:\n  workflow_call: {}\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash .fleet-doctor/scripts/fleet-doctor.sh --module consistentie\n' > "$T/i28eigen/.github/workflows/d.yml"
+mkrepo "$T/i28c2" 0
+printf 'name: caller\non:\n  schedule:\n    - cron: "0 6 * * *"\njobs:\n  c:\n    uses: KCTHolman/fleet/.github/workflows/d.yml@main\n' > "$T/i28c2/.github/workflows/c.yml"
+bash "$DOCTOR" --module afhankelijkheden --root "$T/i28c2" --fleet-root "$T/i28eigen" >/dev/null 2>&1
+if [ $? = 0 ]; then ok "eigen checkout telt niet als consument-eis"; else bad "vals-positief op .fleet-doctor/-pad"; fi
+
+# Zonder checkout kun je de eis niet lezen: waarschuwen, niet hard falen — anders wordt een
+# ontbrekend gereedschap als een bevinding gelezen (zelfde regel als bij de jq-guard).
+bash "$DOCTOR" --module afhankelijkheden --root "$T/i28mis" >/dev/null 2>&1
+if [ $? = 0 ]; then ok "geen --fleet-root => waarschuwing, geen harde fout"; else bad "ontbrekende fleet-root zou zacht moeten zijn"; fi
+
+# DE BELANGRIJKSTE VAN DIT BLOK. De repo-naam in de `uses:`-verwijzing is een PARAMETER, geen
+# constante — deze logica wordt onder meer dan één naam aangeroepen. Staat die naam hardgecodeerd,
+# dan matcht de grep niets, meldt de module vrolijk ✅ en bewaakt 'ie niets. Dat is exact de
+# faalvorm die I28 zélf aan de kaak stelt, en precies daarom mag 'ie hier niet op vertrouwen
+# rusten maar hoort er een test omheen.
+mkrepo "$T/i28alias" 0
+printf 'name: caller\non:\n  pull_request: {}\njobs:\n  c:\n    uses: KCTHolman/deSchouwVloot/.github/workflows/station.yml@main\n' > "$T/i28alias/.github/workflows/c.yml"
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28alias" --fleet-root "$T/i28fleet" --fleet-repo KCTHolman/deSchouwVloot 2>&1)"; rc=$?
+if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "I28"; then
+  ok "--fleet-repo stuurt de match => ook onder een andere repo-naam bewaakt 'ie echt"
+else
+  bad "alias-naam niet herkend (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# Andersom: staat de vlag NIET op de naam die in de caller staat, dan mag de module niet doen
+# alsof 'ie iets controleerde. "Geen stations gevonden" is een ander antwoord dan "alles klopt".
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28alias" --fleet-root "$T/i28fleet" 2>&1)"
+if printf '%s' "$out" | grep -q "roept geen stations"; then
+  ok "naam matcht niet => zegt eerlijk dat er niets te toetsen viel"
+else
+  bad "onduidelijk gemeld bij een niet-matchende repo-naam"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
 echo "fleet-doctor · echte repo's:"
 
 run "."
