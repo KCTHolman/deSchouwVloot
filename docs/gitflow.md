@@ -406,6 +406,22 @@ per consument voor de agent-runtime. Classic PAT's: uitfaseren (openstaande audi
     waarschuwing, geen effect. Repareer de parser (`sub(/[[:space:]]+#.*$/, "")`) in plaats van de
     comment weg te halen — de volgende schrijver zet 'm er weer neer.
 
+15. **PR groen, auto-merge probeert het, GitHub weigert met "the base branch policy prohibits the
+    merge"** → de ruleset eist één approving review en die is er niet. Gemeten 2026-07-28:
+    auto-merge pákte de PR wel en deed de merge-call; GitHub blokkeerde. Belangrijk onderscheid dat
+    hieruit volgt: **auto-merge merget wel PR's die de APP opende** (bump-PR's onder de
+    machinerie-identiteit gingen zo zonder mens door), **maar niet die onder een mens-identiteit
+    zijn geopend** — daar telt alleen een echte approval. "Chore merget op groen" geldt dus alleen
+    bij app-auteurschap. Dat is een **gemeten grens van de autonomie, geen storing**; noteer 'm als
+    zodanig in plaats van 'm weg te configureren.
+16. **Een verse trigger die de review NIET vernieuwt** → `pr-review` luistert op
+    `opened, reopened, ready_for_review, labeled` en **niet op `synchronize`**. `gh pr update-branch`
+    geeft dus wel een verse check-cyclus maar géén nieuwe review; dismisst de ruleset stale reviews
+    bij nieuwe commits, dan raakt de PR z'n approval kwijt zonder die terug te kunnen krijgen.
+    Vandaar dat de regel luidt "`gh pr update-branch` **+ label/reopen**" — die tweede helft is niet
+    optioneel maar precies het stuk dat de review opnieuw aftrapt (label `needs-review` toevoegen
+    volstaat). Geverifieerd 2026-07-28.
+
 ## 11. Invarianten (voer voor de fleet-doctor)
 
 | # | Invariant | Gecheckt door |
@@ -523,6 +539,12 @@ nieuwe infrastructuur: het is een bestand per station, gecureerd door de bestaan
 | I26 | **[opw]** Een caller verleent minstens de permissies die z'n fleet-workflow nodig heeft (union van workflow- én job-permissies). Een tekort geeft `startup_failure`: de run start niet, er is geen log, en de fout noemt de oorzaak niet — gemeten 2026-07-28 op zeven van de tien callers tegelijk | doctor:permissies |
 | I25 | **[opw]** Geen enkele spine-workflow staat `disabled_manually`/`disabled_inactivity` — een uitgezette motor moet luid melden, niet stil zijn (gemeten 2026-07-28: `auto-merge` stond 10 dagen uit zonder dat iets het merkte) | doctor:spine |
 | I27 | **[opw]** Elke `workflow_run`-luisteraar heeft ná de laatste voltooide run van z'n bron zélf een run gehad (event=`workflow_run`, speling 30 min). **De enige invariant die GEDRAG meet in plaats van configuratie**, en daarmee de enige die stille non-actie ziet: op 2026-07-27 stond alles goed — state, pad, naam, permissies — en gebeurde er tóch tien uur niets. Bewust relatief en niet absoluut: een ouderdomsdrempel in dagen had die tien uur niet gezien | doctor:liveness |
+| I28 | **[opw]** Roept een consument een station aan dat een script uit de CONSUMENT gebruikt, dan bestaat dat script daar ook. De eis wordt uit de stationsdefinitie zelf gelezen, niet uit een handmatig bijgehouden lijst die achterloopt. Ontbreekt het script, dan draait het station op z'n faalpad **zonder dat iets rood wordt**: `auto-merge` stuurt bij zo'n consument fail-closed elke PR naar een mens en merget dus per constructie nooit meer (gemeten 2026-07-28 bij het aanhaken van een tweede consument) | doctor:afhankelijkheden |
+
+I23, I27 en I28 zijn drie onafhankelijke gevallen van dezelfde faalklasse — zie
+[README §Groen is geen bewijs](../README.md). Dat ze los van elkaar zijn ontdekt en pas achteraf
+één patroon bleken, is de reden dat het patroon hier expliciet staat: de vierde plek waar het
+opduikt zoek je anders opnieuw van voren af aan.
 
 ---
 
