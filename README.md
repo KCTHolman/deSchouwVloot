@@ -20,7 +20,7 @@ echt; wat eruit is gehaald staat hieronder expliciet benoemd.
 
 De meeste CI-opstellingen groeien organisch: een workflow hier, een cron daar, en na een jaar weet
 niemand meer welke poort wat bewaakt. Dit is een poging tot het tegenovergestelde — een pijplijn
-die is **ontworpen**, met drie ideeën als ruggengraat:
+die is **ontworpen**, met vier ideeën als ruggengraat:
 
 **1. Elke poort is machine-checkbaar, of het is geen poort.** Menselijke aandacht is de schaarste.
 In het hele systeem zitten precies drie plekken waar een mens verschijnt: feature-approval,
@@ -37,6 +37,24 @@ testset waarin alles met 3-0 wint, slaagt namelijk voor altijd en bewaakt dus ni
 **3. De pijplijn repareert zichzelf; escalatie is de uitzondering.** Een watchdog, een
 conflict-solver en een autofix-laag draaien zonder tussenkomst. De `fleet-doctor` rapporteert hard
 maar muteert nooit — diagnose en mutatie zijn bewust gescheiden bevoegdheden.
+
+**4. Groen is geen bewijs.** Het derde idee hierboven is een generalisatie van het tweede, en het
+kostte drie afzonderlijke incidenten voordat dat opviel. De gevaarlijkste storing in een pijplijn
+is niet de rode build — die ziet iedereen. Het is de check die **altijd hetzelfde antwoordt** en
+daardoor van buiten niet te onderscheiden is van een check die werkt:
+
+| | Wat er groen staat | Wat er werkelijk gebeurt |
+|---|---|---|
+| **I23** | de golden-set slaagt | elk geval wint met 3-0, dus geen enkel te breed trefwoord kán iets kantelen — de run slaagt voor altijd |
+| **I27** | trigger, pad, naam en permissies allemaal correct | tien uur lang geen enkele run; de complete spine lag plat |
+| **I28** | de spine "werkt", niets is rood | een station mist een script bij de consument, draait fail-closed, en merget per constructie nooit meer |
+
+Drie keer dezelfde vorm, drie keer los ontdekt, elk met een datum en een gemeten aanleiding. De
+verdediging is telkens hetzelfde principe: **meet het gedrag, niet de configuratie.** I27 doet dat
+letterlijk (liep de bron, en reageerde de luisteraar?). I23 dwingt het af door grensgevallen met
+marge 1 te eisen — een testset waarin alles met 3-0 wint, bewaakt niets. I28 leidt de eis af uit de
+stationsdefinitie zelf in plaats van uit een handmatige lijst, want zo'n lijst loopt achter zonder
+dat iets dat meldt. Zie [docs/gitflow.md §11](docs/gitflow.md).
 
 **Waar te beginnen:** [docs/architectuur.md](docs/architectuur.md) is de kaart —
 de vier lagen, de pijplijn met z'n drie mens-poorten, het consumer-contract en het security-model.
@@ -154,8 +172,26 @@ bash scripts/golden-run.sh
 # de invariant-checker op zichzelf
 bash scripts/fleet-doctor.sh --module consistentie --root .
 
+# I28: eist een aangeroepen station een script dat déze repo niet heeft?
+bash scripts/fleet-doctor.sh --module afhankelijkheden --root . --fleet-root .
+
 # en het bewijs dat niets hier uit zichzelf kan vuren
 bash scripts/check-no-triggers.sh
 ```
 
 Nodig: `bash`, `awk`, `sed`, `python3` met PyYAML. Geen netwerk.
+
+### En daarom is de Actions-tab hier leeg
+
+Dat is geen nalatigheid maar de rekening van de regel hierboven. Elke workflow hier is
+`workflow_call`-only, inclusief `checks.yml` — en een reusable workflow die niemand aanroept,
+draait nooit. Er is in deze repo dus **geen enkele automatische run**; alle guards hierboven zijn
+handwerk, of ze draaien in de context van een consument die ze aanroept.
+
+Dat is een echte afweging en het is de moeite waard om 'm hardop te maken, want in het licht van
+idee 4 hierboven is het precies het scherpe randje: een testsuite die niemand aftrapt, is een
+testsuite die altijd hetzelfde antwoordt. Een `pull_request`-caller op `ubuntu-latest` zonder
+secrets zou hier veilig zijn — maar "alleen veilige triggers" is nou juist de formulering die deze
+repo bewust niet hanteert, omdat die weer op een beoordeling per geval leunt in plaats van op een
+eigenschap die een script kan vaststellen. De keuze is dus: geen triggers, en de prijs zichtbaar
+opschrijven in plaats van 'm te verstoppen achter een badge.
