@@ -22,7 +22,8 @@ on:
         description: >
           Komma-lijst van modules: `consistentie` (I1/I2/I5/I7, bestandsgebaseerd),
           `permissies` (I26), `contract` (.fleet.yml), `spine` (I25, workflow-states),
-          `runners` (I10/I11, override + lane-beschikbaarheid) en/of `liveness` (I27).
+          `runners` (I10/I11, override + lane-beschikbaarheid), `liveness` (I27) en/of
+          `afhankelijkheden` (I28: eist een aangeroepen station een script dat déze repo mist?).
           `liveness` meet GEDRAG in plaats van configuratie: liep de bron, en reageerde de
           luisteraar? Dat is de enige module die stille non-actie ziet — de faalklasse die op
           2026-07-27 de complete spine tien uur platlegde terwijl elke andere check groen bleef.
@@ -121,6 +122,12 @@ jobs:
           MODULES: ${{ inputs.modules }}
           SPINE: ${{ inputs.spine }}
           HAS_RUNNER_TOKEN: ${{ secrets.RUNNER_CHECK_TOKEN != '' }}
+          # `github.repository` is de AANROEPER; `github.job_workflow_ref` is de ref van DEZE
+          # reusable workflow (`owner/repo/.github/workflows/doctor.yml@ref`). I28 zoekt in de
+          # callers van de consument naar verwijzingen naar ons, en moet dus weten onder welke
+          # naam 'ie werkelijk is aangeroepen — die naam hardcoderen zou de module stilzwijgend
+          # niets laten vinden en tóch ✅ laten melden.
+          JOB_WF_REF: ${{ github.job_workflow_ref }}
         run: |
           set -uo pipefail
           rc=0
@@ -129,6 +136,12 @@ jobs:
           out() { tee -a "$GITHUB_STEP_SUMMARY"; }
 
           printf '# Fleet-doctor — %s\n\n' "$REPO" | out
+
+          # Eerste twee segmenten van de job_workflow_ref = `owner/repo`. Valt die om wat voor
+          # reden dan ook weg, dan liever de bekende default dan een lege vlag: een lege
+          # `--fleet-repo` matcht álles en zou van I28 ruis maken.
+          FLEET_REPO="$(printf '%s' "${JOB_WF_REF:-}" | cut -d/ -f1,2)"
+          [ -n "$FLEET_REPO" ] || FLEET_REPO="KCTHolman/fleet"
 
           IFS=',' read -ra mods <<< "$MODULES"
           for m in "${mods[@]}"; do
@@ -164,6 +177,9 @@ jobs:
               permissies)   bash .fleet-doctor/scripts/fleet-doctor.sh --module permissies --root . 2>&1 | out ;;
               contract)     bash .fleet-doctor/scripts/fleet-doctor.sh --module contract --root . 2>&1 | out ;;
               liveness)     bash .fleet-doctor/scripts/fleet-doctor.sh --module liveness --repo "$REPO" 2>&1 | out ;;
+              # --fleet-root: I28 leest de eis uit de stationsdefinitie zelf, dus die heeft de
+              # checkout nodig die hier toch al staat. Geen handmatige lijst die achterloopt.
+              afhankelijkheden) bash .fleet-doctor/scripts/fleet-doctor.sh --module afhankelijkheden --root . --fleet-root .fleet-doctor --fleet-repo "$FLEET_REPO" 2>&1 | out ;;
               *)            printf '::error::onbekende module %s\n' "$m"; rc=1 ;;
             esac
             # ${PIPESTATUS[0]} = het script, niet de tee erachter.
