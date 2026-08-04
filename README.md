@@ -36,7 +36,11 @@ testset waarin alles met 3-0 wint, slaagt namelijk voor altijd en bewaakt dus ni
 
 **3. De pijplijn repareert zichzelf; escalatie is de uitzondering.** Een watchdog, een
 conflict-solver en een autofix-laag draaien zonder tussenkomst. De `fleet-doctor` rapporteert hard
-maar muteert nooit — diagnose en mutatie zijn bewust gescheiden bevoegdheden.
+maar muteert nooit — diagnose en mutatie zijn bewust gescheiden bevoegdheden. Sinds kort geldt dat
+ook voor de KPI's zelf: een meting die alleen in een artifact blijft liggen, wordt door niemand
+gelezen. Komt de permission-denial-ratio van een run boven de drempel, dan opent de pijplijn daar nu
+zélf een issue over — van *meten* naar *melden*, zonder dat er een mens hoeft te grasduinen in
+logs om te zien dat er iets structureel scheef staat.
 
 **4. Groen is geen bewijs.** Het derde idee hierboven is een generalisatie van het tweede, en het
 kostte drie afzonderlijke incidenten voordat dat opviel. De gevaarlijkste storing in een pijplijn
@@ -87,8 +91,11 @@ werkt zonder GitHub-organisatie: er zijn geen org-level runners of org-secrets n
 Het contract tussen beide is één bestand: [`.fleet.yml`](.fleet.yml). Lanes, poorten, budgetten,
 labelnamen en de "spine" (workflows waarvan uitval *stil* zou zijn). Zie
 [`examples/tweede-consument.fleet.yml`](examples/tweede-consument.fleet.yml) voor hoe datzelfde
-contract eruitziet bij een project met een heel andere vorm — dat is de echte test of de
-abstractie draagt.
+contract eruitziet bij een project met een heel andere vorm — dat was de theorie; inmiddels is de
+proef ook echt gedaan. Sinds afgelopen week draait er een tweede, functioneel geheel ander project
+op de Vloot: andere taal, andere stack, geen self-hosted runner, alleen GitHub-hosted lanes. Geen
+regel fleet-logica geforkt om dat werkend te krijgen — dat is precies de test of de abstractie
+draagt, en die test is nu met een echt project doorstaan, niet alleen met een voorbeeldbestand.
 
 ---
 
