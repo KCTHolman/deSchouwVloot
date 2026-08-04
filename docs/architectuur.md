@@ -1,7 +1,8 @@
 # deFleet-architectuur — de autonome projectbouwer
 
-**Status:** ontwerp v1 (2026-07-27) · geschreven na het bewijs van fase 2 (probe groen op
-`ubuntu-latest` + `biohack-light`, pick-runner verhuisd, 38 callers live cross-repo).
+**Status:** ontwerp v1 (2026-07-27), bijgewerkt (2026-08-04) · geschreven na het bewijs van fase 2
+(probe groen op `ubuntu-latest` + `biohack-light`, pick-runner verhuisd, 38 callers live
+cross-repo) · fase 4 (tweede consument) is inmiddels gestart, zie §9.
 **Scope:** puur de workflow-/runner-machinerie. Wat een consument inhoudelijk bouwt (app, web,
 data) is hier bewust een black box achter een contract.
 
@@ -19,7 +20,7 @@ gemeten pijnpunt uit BiohackOS:
 | P2 | **Menselijke aandacht is de schaarste** | ~⅔ van de merges bleek CI-onderhoud; het doel is dat de eigenaar alleen features/architectuur approvet |
 | P3 | **De pijplijn repareert zichzelf** | De watchdog (reconciler-cron) + conflict-solver + autofix bestaan al; het ontwerp maakt zelf-herstel de norm, escalatie (`needs-human`) de uitzondering |
 | P4 | **Kosten zijn een routeringsinput** | Sonnet-per-default, override-vars om GitHub-minuten te sparen, 1-slot-wachtrij tot 78 min — model-, runner- en turn-budget horen per taaktype geconfigureerd, niet per incident |
-| P5 | **Het systeem meet zichzelf en leert** | agent-retro/borg-review-lessen bestaan al; elke structurele fix hier begon met een nulmeting (6,2 denials/run, 18,4% max-turns, 30,8% dubbele builds) |
+| P5 | **Het systeem meet zichzelf en leert — en meldt zichzelf** | agent-retro/borg-review-lessen bestaan al; elke structurele fix hier begon met een nulmeting (6,2 denials/run, 18,4% max-turns, 30,8% dubbele builds). Een KPI die alleen in een artifact staat, wordt door niemand gelezen — daarom opent de pijplijn nu zelf een issue zodra de denial-ratio van een run de drempel overschrijdt: van passief meten naar actief melden. |
 | P6 | **Verhuizen ≠ verbeteren, en één bron van waarheid** | De 4 gedrifte kopieën bij de tweede consument zijn het schrikbeeld; logica leeft één keer, in deze repo |
 
 ## 2. Systeemoverzicht — vier lagen
@@ -219,6 +220,11 @@ Ontwerpkeuzes:
 - **De agent-lane-vorm is het eindbeeld voor álle lanes**: ephemeral container per job, per-lane
   user, cache-volumes, verse registratie per run. De wrapper-loop + `Dockerfile.{lane}` bestaan al;
   light eerst (kleinste toolchain, laagste risico), heavy laatst (`heavy-2` blijft vangnet).
+  **Gemeten valkuil:** een gemount cache-volume is niet automatisch de plek waar de toolchain z'n
+  cache zoekt — een SDK-cache die stil naast het gemounte volume schreef in plaats van erin, bleek
+  pas op te vallen doordat elke run de cache toch opnieuw opbouwde. De omgevingsvariabele die de
+  toolchain naar het gemounte pad wijst, hoort dus met dezelfde stelligheid gezet te worden als het
+  volume zelf — een cache-mount zonder die knop is geen cache, alleen schijfruimte.
 - **Routering: één beslispunt.** Vandaag zijn er twee mechanismen: pick-runner (availability-check)
   en de `RUNNER_OVERRIDE_*`-vars die 'm kortsluiten (credits-modus). Dat blijft — maar expliciet
   gerangschikt: override-var = kill-switch/kostenmodus, picker = default zodra minuten geen
@@ -266,7 +272,11 @@ Drie structurele token-besluiten:
    het gevolg).
 2. **Pin-beleid gelaagd:** third-party actions → SHA (audit-blocker, staat nog open); fleet-refs →
    `@main` zolang er één consument is, **SHA/tag zodra de tweede aanhaakt** (vastgelegd in
-   het migratielogboek); GitHub-eigen actions → major-tag.
+   het migratielogboek); GitHub-eigen actions → major-tag. **Status:** de tweede consument is
+   inmiddels aangehaakt, en het pin-beleid staat sindsdien ook echt aan — fleet-refs draaien op
+   een SHA-pin met een nachtelijke bump-job die zichzelf ongepind laat (een kapotte pin mag zijn
+   eigen reparatie niet kunnen blokkeren) en pas bumpt nadat de canary (deFleet zelf, op `@main`)
+   groen is.
 3. **Fleet voegt nooit netwerkbestemmingen toe.** Constitution-grenzen van consumenten (welke
    API's, welke data) zijn per definitie buiten fleet-scope; een fleet-workflow praat alleen met
    GitHub zelf.
@@ -275,7 +285,7 @@ Drie structurele token-besluiten:
 
 | Gemeten lek (nulmeting 2026-07-19) | Structureel antwoord in dit ontwerp |
 |---|---|
-| 6,2 permission-denials/run, 40-45% herhalingen | Per-station allowlist-profielen in de agent-run-workflow (triage hoeft minder dan build); de ci-agent-gedragslessen verhuizen mee als prompt-partial voor élke consument |
+| 6,2 permission-denials/run, 40-45% herhalingen | Per-station allowlist-profielen in de agent-run-workflow (triage hoeft minder dan build); de ci-agent-gedragslessen verhuizen mee als prompt-partial voor élke consument. **Nieuw:** de ratio wordt niet alleen gemeten maar ook bewaakt — komt hij boven een drempel, dan opent de pijplijn daar zelf een issue over, in plaats van te wachten tot iemand toevallig de KPI-log opent |
 | 18,4% `error_max_turns` | Turn-budget per taaktype in `.fleet.yml` (`budgets.max_turns`); retro bewaakt de verhouding budget↔faalkans per station |
 | 30,8% dubbele builds | Concurrency-groepen op subject (issue/PR), gestandaardiseerd in de fleet-skeletten — nooit meer per workflow uitgevonden |
 | Wachtrij tot 78 min op 1-slot-lane | Agent-lane heeft nu 2 slots; picker + override als capaciteitsregelaar; KPI bewaakt wachttijd |
@@ -318,10 +328,12 @@ bestaat.
 **`agent-run`/`claude.yml` als allerlaatste** (grootste bestand, elf afnemers). Elke stap: consument
 draait één week op de fleet-versie naast ongewijzigd gedrag vóór de volgende.
 
-**Fase 4 — Tweede consument als validatie:** volledig op `ubuntu-latest` (geen self-hosted host-claim),
-minimale `.fleet.yml`, de 4 gedrifte kopieën vervangen door callers. Succescriterium: de tweede consument
-krijgt de complete raket zonder één regel fleet-logica te forken. **Dit is het moment van het
-SHA-pin-besluit.**
+**Fase 4 — Tweede consument als validatie: inmiddels gestart, niet meer alleen een plan.** Een
+tweede project — andere taal, andere stack, volledig op `ubuntu-latest`, geen self-hosted
+host-claim — is aangehaakt met een minimale `.fleet.yml` en de eerste dunne callers. Succescriterium
+blijft: de complete raket zonder één regel fleet-logica te forken, en de eerste stap (een
+zuivere gitflow-workflow zonder projectkennis) staat er al. Dit is ook het moment van het
+SHA-pin-besluit — zie §7.2, dat besluit is genomen en staat aan.
 
 **Fase 5 — org + runner-groups** (besluit ligt bij de eigenaar; haken in het migratielogboek). **Fase 6 —
 nazorg:** oude paden opruimen, lessen → retro.
