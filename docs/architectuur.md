@@ -158,6 +158,52 @@ stuur (slepen = dispatchen), terwijl elke uitvoering in z'n eigen repo-context b
 al-bekende org-haak: bij een latere org-migratie moet dit bord als org-project opnieuw worden
 opgebouwd (open beslissing).
 
+## 3c. Extra ingang op de Build-poort — interactief `/pickup` (ontwerp, 2026-08-06)
+
+**Status:** ontwerp goedgekeurd, wacht op spec-review + implementatieplan. Nog niet gebouwd — dit
+is de tegenhanger van §3b hierboven, maar dan op het **Build**-station (RAKET-trap 3) in plaats van
+op intake.
+
+**Aanleiding.** De `agent-run`/`claude.yml`-workflow is nu de enige manier waarop trap 3 (branch →
+PR) gebeurt. Interactieve, native Claude Code-sessies werken merkbaar beter dan de Actions-runner
+voor ditzelfde bouwwerk. Het ontwerp voegt daarom een tweede front-deur toe op precies dezelfde
+poort: additief, niet vervangend — `claude.yml`, `epic-orchestrator.yml` en de overige autonome
+workflows blijven ongewijzigd draaien voor achtergrond- en afwezigheidswerk. `/pickup #<issue>` is
+een ander startpunt voor dezelfde poort, geen kortere weg eromheen.
+
+```mermaid
+flowchart LR
+    KOEN["eigenaar (chat)\n/pickup #123"] --> GATE["RAKET-gate check\n(zelfde poort als claude.yml)"]
+    ACTIE["claude.yml / epic-orchestrator.yml\n(autonoom, ongewijzigd)"] --> GATE
+    GATE --> CLAIM["claim: label claude-code-sessie\n+ read-after-write"]
+    CLAIM --> BUILD["subagent bouwt in worktree:\npreflight --strict → analyze/test → PR"]
+    BUILD --> PR["PR open, label af"]
+```
+
+**De drie ontwerppunten die het verschil maken tussen "extra ingang" en "sluipweg":**
+
+1. **Dezelfde RAKET-gate, vóór er iets wordt aangeraakt.** Governance/impactanalyse moet al
+   goedgekeurd zijn (features), pure `fix`/`chore`/`docs`/`ci` mag direct — identiek aan wat
+   `claude.yml` nu afdwingt. Bij een epic-fase-issue geldt bovendien dezelfde "bouw op de
+   realiteit, niet alleen op het plan"-check: de vorige fase moet groen/gemerged zijn.
+2. **Eén claim, geen dubbele build.** Label `claude-code-sessie` + read-after-write-bevestiging
+   voorkomt dat een interactieve sessie en de autonome Action hetzelfde issue tegelijk oppakken.
+   Het race-venster zat 'm niet in het label zelf maar in het moment van checken: de her-check
+   hoort niet vooraan in een run, maar vlak vóór de daadwerkelijke dispatch — in `claude.yml`'s
+   `implement`-job direct na `needs: pick`, en in `epic-orchestrator.yml`'s `advance_milestone()`
+   direct vóór de dispatch-call. Zo krimpt het venster van "hele run-duur" terug tot vrijwel nul.
+3. **Bot-identiteit, niet eigenaar-identiteit.** Commits en PR's uit een interactieve sessie
+   verschijnen onder dezelfde GitHub App-identiteit die `claude.yml` al gebruikt (token gemint per
+   sessie, nooit een los `.pem`-bestand op schijf) — niet als Koen zelf. Daarmee blijft de
+   bestaande code-owner-approval-gate (§3, "Merge") betekenisvol, ongeacht via welke ingang de PR
+   is geopend.
+
+Uitdrukkelijk **buiten scope** voor dit ontwerp: een loop die meerdere epic-fasen achter elkaar
+afwerkt in één sessie (blijft één fase per aanroep), en het vervangen van review/triage/andere
+autonome stations door een interactief pad — die blijven op de Action. Zie ook §3 hierboven: de
+drie mens-poorten (feature-approval, release-approval, `needs-human`) veranderen door dit ontwerp
+niet — `/pickup` voegt een ingang toe, geen poort.
+
 ## 4. Het consumer-contract
 
 Wat een project-repo levert om "op de fleet" te draaien:

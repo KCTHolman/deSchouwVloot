@@ -88,6 +88,18 @@ Het dragende mechanisme is dat een reusable workflow draait in de **context van 
 De Vloot levert dus de logica, de consument levert de hardware en de secrets. Dat is ook waarom dit
 werkt zonder GitHub-organisatie: er zijn geen org-level runners of org-secrets nodig.
 
+### Een tweede ingang op dezelfde poort: interactief bouwen (ontwerp)
+
+Trap 3 van de RAKET (bouwen: branch → PR) loopt nu uitsluitend via de autonome
+`claude-code-action`-workflow. Interactieve, native Claude Code-sessies bouwen merkbaar prettiger
+dan diezelfde Actions-runner — vandaar een ontwerp voor `/pickup #<issuenummer>`, een skill die
+diezelfde bouwstap ook vanuit een chatsessie laat oppakken. **Additief, niet vervangend:** de
+autonome workflow blijft de standaardroute voor achtergrondwerk en werkt onveranderd door; `/pickup`
+is er alleen bij, voor de gevallen waarin de eigenaar zelf meebouwt. Beide routes lopen door
+dezelfde RAKET-gate, dezelfde claim (voorkomt dat ze hetzelfde issue dubbel oppakken) en dezelfde
+bot-identiteit — geen van beide krijgt een kortere weg. Zie
+[docs/architectuur.md §3c](docs/architectuur.md) voor het volledige ontwerp en de status.
+
 Het contract tussen beide is één bestand: [`.fleet.yml`](.fleet.yml). Lanes, poorten, budgetten,
 labelnamen en de "spine" (workflows waarvan uitval *stil* zou zijn). Zie
 [`examples/tweede-consument.fleet.yml`](examples/tweede-consument.fleet.yml) voor hoe datzelfde
