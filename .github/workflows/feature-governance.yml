@@ -1,0 +1,254 @@
+name: "[fleet] Feature governance"
+
+# Dwingt de impactanalyse af als required check `impactanalyse` — zie docs/impactanalyse.md.
+# Geport uit BiohackOS (PR #2028/#2031, 2026-08-12): de vragenlijst ging daar van tien
+# self-attesterende vinkjes naar een machine-leesbare IA-code met kruiscontrole tegen de diff.
+# Dit is die IA-code-versie, meteen bij de eerste migratie naar Fleet — er is geen oudere
+# vinkjes-vorm om hier apart te "verbeteren" (AGENTS.md §Harde grenzen "Verhuizen ≠ verbeteren"
+# geldt onverkort: dit IS de huidige, bewezen vorm uit de bronrepo, niet een eigen opwaardering).
+#
+# EEN FEATURE-PR IS NIET MERGEBAAR ZONDER EEN COMPLETE, KLOPPENDE IA-CODE. De default is
+# omgedraaid: de analyse wordt afgeleid uit het TYPE van de PR (conventional-commit-titel).
+# Alleen een feature vereist de analyse; fix/chore/docs/ci/refactor/test/perf/build/style worden
+# automatisch overgeslagen.
+#
+# Feature wordt herkend aan (één is genoeg):
+#   - PR-titel begint met `feat:` / `feat(scope):` / een `!` breaking-marker / BREAKING CHANGE;
+#   - branch `feat*/feature*`;
+#   - label `feature` / `enhancement` / `feat`;
+#   - het vakje "Feature" in het PR-template is aangevinkt.
+# Nooduitzondering: label `governance-exempt`.
+#
+# WAAROM `runner` EN NIET pick-runner+lane-label (zoals pr-label.yml). Dit is machinerie zonder
+# domein-toolchain — secondenwerk, geen build. Doctor.yml koos dezelfde simpele vorm: één
+# `runner`-input met een neutrale default. Een consument met een eigen lichte lane geeft die
+# gewoon mee (`runner: biohack-light`); zonder opgave draait het gewoon op ubuntu-latest.
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        type: string
+        required: false
+        default: ubuntu-latest
+        description: Runner om op te draaien. Secondenwerk — een consument met een lichte lane geeft die hier door.
+      schema_path:
+        type: string
+        required: false
+        default: .github/impact-codes.yml
+        description: Pad naar het IA-code-schema van de AANROEPER (velden/waarden/regels — zie examples/impact-codes.example.yml).
+      fleet_ref:
+        type: string
+        required: false
+        default: main
+        description: Ref van deze repo waaruit check-impact.sh komt. Volgt het pin-beleid van de aanroeper.
+      policy_doc_path:
+        type: string
+        required: false
+        default: docs/impactanalyse.md
+        description: Pad (in de aanroeper) naar de mensvriendelijke uitleg van je eigen IA-code, voor de link in de sticky comment.
+    secrets:
+      APP_ID:
+        required: false
+        description: >
+          App-ID van de machinerie-identiteit. Nodig om deze PRIVÉ-repo uit te checken voor
+          check-impact.sh — de `GITHUB_TOKEN` van de aanroeper heeft daar geen toegang toe.
+      APP_PRIVATE_KEY:
+        required: false
+        description: Private key bij APP_ID. Zie `WORKFLOW_APP_PRIVATE_KEY` voor de oude naam.
+      WORKFLOW_APP_ID:
+        required: false
+        description: Alternatieve naam voor APP_ID (BiohackOS gebruikt deze sinds 2026-07-14).
+      WORKFLOW_APP_PRIVATE_KEY:
+        required: false
+        description: Alternatieve naam voor APP_PRIVATE_KEY.
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: feature-governance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  impactanalyse:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 5 # één validatiescript, geen build
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      PR: ${{ github.event.pull_request.number }}
+      HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      TITLE: ${{ github.event.pull_request.title }}
+      SCHEMA: ${{ inputs.schema_path }}
+      POLICY_DOC: ${{ inputs.policy_doc_path }}
+      MARKER: "<!-- feature-governance-bot -->"
+    steps:
+      # Stap 1 bepaalt of dit überhaupt een feature is — dat kost geen checkout, dus de meeste
+      # PR's (fix/chore/docs) slaan alle volgende stappen over.
+      - name: Classificeer PR
+        id: type
+        run: |
+          set -uo pipefail
+
+          BODY="$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" | tr -d '\r')"
+          LABELS="$(jq -r '.pull_request.labels[].name' "$GITHUB_EVENT_PATH")"
+
+          has_label() { printf '%s\n' "$LABELS" | grep -qiE "^$1$"; }
+          in_body()   { printf '%s\n' "$BODY"   | grep -qiE "$1"; }
+
+          exempt=false
+          if has_label 'governance-exempt'; then exempt=true; fi
+
+          is_feature=false
+          reason=""
+          # 1) Conventional-commit-type uit de PR-titel — de primaire bron.
+          if printf '%s' "$TITLE" | grep -qiE '^feat(\([^)]+\))?!?:'; then
+            is_feature=true; reason="titel-type feat"
+          # Breaking = `type!:` in de titel, of de conventional-commit-VOETNOOT `BREAKING CHANGE:`
+          # in de body. Bewust case-SENSITIVE en geankerd, zodat losse proza geen valse
+          # feature-classificatie triggert.
+          elif printf '%s' "$TITLE" | grep -qE '^[a-z]+(\([^)]+\))?!:' \
+               || printf '%s\n' "$BODY" | grep -qE '^BREAKING[ -]CHANGE:'; then
+            is_feature=true; reason="breaking change"
+          # 2) Branchnaam.
+          elif printf '%s' "$HEAD_REF" | grep -qiE '^(feat|feature)/'; then
+            is_feature=true; reason="branchnaam ($HEAD_REF)"
+          # 3) Expliciet label of aangevinkt vakje.
+          elif has_label 'feature' || has_label 'enhancement' || has_label 'feat'; then
+            is_feature=true; reason="label"
+          elif in_body '^\s*-\s*\[[xX]\]\s*Feature\b'; then
+            is_feature=true; reason='vakje "Feature" aangevinkt'
+          fi
+
+          nf_type="$(printf '%s' "$TITLE" | grep -oiE '^(fix|chore|docs|ci|refactor|test|perf|build|style)' | head -n1 || true)"
+
+          status=""; title=""; detail=""
+          if $exempt; then
+            status="skip"
+            title="Overgeslagen — label \`governance-exempt\`"
+            detail="De impactanalyse is bewust overgeslagen. Dit is een nooduitzondering en blijft zichtbaar in de review."
+          elif ! $is_feature; then
+            status="skip"
+            title="Geen feature — analyse niet vereist"
+            t="${nf_type:-niet-feature}"
+            detail="Herkend als \`$t\`-wijziging (geen nieuw gedrag / geen schema-/architectuurimpact). De impactanalyse geldt alleen voor feature-PR's."
+          fi
+
+          printf '%s\n' "$BODY" > "$RUNNER_TEMP/pr-body.md"
+
+          {
+            echo "status=$status"
+            echo "title=$title"
+            echo "reason=$reason"
+          } >> "$GITHUB_OUTPUT"
+          { echo 'detail<<__EOF__'; echo "$detail"; echo '__EOF__'; } >> "$GITHUB_OUTPUT"
+
+      # Alleen het feature-pad heeft het schema van de aanroeper nodig.
+      - name: Aanroeper uitchecken
+        if: steps.type.outputs.status == ''
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      # check-impact.sh woont hier (Fleet), niet bij de aanroeper — zelfde reden als doctor.yml:
+      # deze repo is privé en de GITHUB_TOKEN van de aanroeper heeft er geen toegang toe.
+      - name: App-token munten (leestoegang tot de fleet-repo)
+        id: app
+        if: steps.type.outputs.status == ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID || secrets.WORKFLOW_APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.WORKFLOW_APP_PRIVATE_KEY }}
+          owner: KCTHolman
+          repositories: fleet
+
+      - name: check-impact.sh ophalen
+        if: steps.type.outputs.status == ''
+        uses: actions/checkout@v7
+        with:
+          repository: KCTHolman/fleet
+          ref: ${{ inputs.fleet_ref }}
+          path: .fleet-lib
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
+
+      - name: Valideer IA-code
+        id: check
+        if: steps.type.outputs.status == ''
+        env:
+          REASON: ${{ steps.type.outputs.reason }}
+        run: |
+          # `set +e` is hier essentieel. GitHub draait een `run:`-blok als `bash -e {0}`, en
+          # `set -uo pipefail` zet die `-e` niet uit. Een falende commando-substitutie in een
+          # toewijzing (`out="$(check-impact.sh …)"`) zou de stap dan afbreken vóór `rc=$?` en
+          # vóór het wegschrijven van status/title/detail — de check zou terecht rood gaan, maar
+          # zonder één woord uitleg. Les uit BiohackOS PR #2028/#2031 (zelfde faalmodus, daar
+          # gemeten op de eerste echte feature-PR na invoering).
+          set +e
+          set -uo pipefail
+
+          gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename' \
+            > "$RUNNER_TEMP/pr-files.txt" || true
+
+          out="$(bash .fleet-lib/scripts/check-impact.sh \
+                   --schema "$SCHEMA" \
+                   --body  "$RUNNER_TEMP/pr-body.md" \
+                   --files "$RUNNER_TEMP/pr-files.txt" 2>&1)"
+          rc=$?
+
+          if [ "$rc" -eq 0 ]; then
+            echo "status=pass" >> "$GITHUB_OUTPUT"
+            echo "title=Impactanalyse compleet — IA-code klopt met de diff ✅" >> "$GITHUB_OUTPUT"
+            d="Herkend als feature-PR ($REASON). $out"
+          else
+            echo "status=fail" >> "$GITHUB_OUTPUT"
+            echo "title=Impactanalyse onvolledig — PR nog niet mergebaar ❌" >> "$GITHUB_OUTPUT"
+            d="Herkend als feature-PR ($REASON). Los op vóór merge:"$'\n'"$out"
+            d="$d"$'\n\n'"<details><summary>De in te vullen IA-code + toegestane antwoorden</summary>"$'\n\n'
+            d="$d$(bash .fleet-lib/scripts/check-impact.sh --schema "$SCHEMA" --sjabloon)"$'\n\n'
+            d="$d$(bash .fleet-lib/scripts/check-impact.sh --schema "$SCHEMA" --uitleg)"$'\n\n'"</details>"
+          fi
+          { echo 'detail<<__EOF__'; echo "$d"; echo '__EOF__'; } >> "$GITHUB_OUTPUT"
+
+      # --- Rapport (sticky comment) --------------------------------------------------------
+      - name: Rapporteer
+        if: always()
+        env:
+          TITLE:  ${{ steps.type.outputs.title  || steps.check.outputs.title }}
+          DETAIL: ${{ steps.type.outputs.detail || steps.check.outputs.detail }}
+        run: |
+          set -uo pipefail
+
+          # Vangnet: komt de titel leeg binnen, dan is een eerdere stap geklapt zonder z'n
+          # outputs te schrijven. Een kapotte guard hoort zichzelf aan te wijzen, niet te
+          # zwijgen — zelfde les als hierboven.
+          if [ -z "$TITLE" ]; then
+            TITLE="De impactanalyse-check zelf liep vast ❌"
+            DETAIL="De validatiestap eindigde zonder resultaat, dus er is geen oordeel over de IA-code. Dit is een storing in de check, niet per se een fout in je PR. Bekijk de runlog: https://github.com/$REPO/actions/runs/$GITHUB_RUN_ID"
+          fi
+
+          {
+            echo "$MARKER"
+            echo "### 🧭 Feature Governance — $TITLE"
+            echo ""
+            echo "$DETAIL"
+            echo ""
+            echo "> Velden + uitleg: [\`$POLICY_DOC\`](https://github.com/$REPO/blob/${HEAD_REF}/$POLICY_DOC) · mechanisme: [\`docs/impactanalyse.md\`](https://github.com/KCTHolman/fleet/blob/main/docs/impactanalyse.md) in deFleet"
+          } > "$RUNNER_TEMP/report.md"
+
+          existing="$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "map(select(.body|contains(\"$MARKER\"))) | .[0].id // empty" 2>/dev/null || true)"
+          if [ -n "$existing" ]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$existing" -F body=@"$RUNNER_TEMP/report.md" >/dev/null || true
+          else
+            gh api -X POST "repos/$REPO/issues/$PR/comments" -F body=@"$RUNNER_TEMP/report.md" >/dev/null || true
+          fi
+
+      - name: Blokkeer bij onvolledige analyse
+        if: steps.check.outputs.status == 'fail'
+        run: |
+          echo "::error title=Feature governance::De IA-code ontbreekt, is onvolledig, of spreekt de diff tegen. Deze PR is niet mergebaar tot de analyse klopt."
+          exit 1

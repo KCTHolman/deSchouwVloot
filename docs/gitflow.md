@@ -115,6 +115,34 @@ GitHub-`permissions` per station: minimaal, per job — de tabel noemt alleen de
 turn-lekken): losse bash-commando's (compound faalt op de matcher), een geweigerde tool-call
 nooit herhalen, geen achtergrond-subagents open laten staan bij het einde van de run.
 
+**De RAG-kennisbron [gevalideerd patroon, nog niet gemigreerd].** BiohackOS (epic #2007, zeven
+fasen, 2026-08-12) geeft trap 2 en trap 3 gerichte context: vóór de agent begint doet
+`scripts/rag-context.mjs` één similarity-search per kennistabel (de bekende faalpatronen +
+chunks van constitution/AGENTS/governance) en injecteert de top-treffers, i.p.v. hele documenten
+opnieuw inlezen bij elke stateloze dispatch. Drie ontwerpkeuzes maken het patroon overdraagbaar:
+
+- **Aanvulling, geen vervanging.** De chunks staan als DATA in de prompt, expliciet gemarkeerd
+  als "mogelijk verouderd — de repo wint". Geen enkele poort (ook niet `impactanalyse`) leunt
+  erop.
+- **Fail-open met precies één melding.** Eén retry bij een falende call; blijft die falen, dan
+  bouwt de agent door zónder die context — de build faalt nooit op deze laag. Stil degraderen is
+  het échte risico (idee #4, "groen is geen bewijs"): een losse ops-melding (niet naar de PR, niet
+  naar gezondheidsdata) waarschuwt zodra het structureel uitvalt, in plaats van dat de kennisbron
+  maandenlang leeg kan draaien terwijl alles groen oogt.
+- **Ruis eruit, trap 1 query't niet mee.** Chunks onder een similarity-drempel vallen af en het
+  totaal is gekapt (~14.000 tekens) — "slechte retrieval is erger dan geen retrieval". Triage
+  (trap 1) blijft bewust de kortste, goedkoopste trap en slaat dit station over.
+
+**Waarom [nog niet gemigreerd] en niet [opwaardering].** Het mechanisme zelf hangt aan de
+kennisbron van de consument (een vectorstore + een embedding-provider — bij BiohackOS Supabase
+pgvector + OpenAI), niet aan iets dat Fleet zelf hoort te hosten (Fleet voegt nooit
+netwerkbestemmingen toe, AGENTS.md §Harde grenzen). Dit is dus geen fleet-`workflow_call`-kandidaat
+maar een **prompt-partial-patroon**: het leespad-script + de drie keuzes hierboven, die élke
+consument met een eigen kennisbron kan overnemen zodra trap 2/3 geparametriseerd worden
+(§9-Fase-3 in architectuur.md, "agent-run/claude.yml als allerlaatste"). Details:
+[`docs/governance/rag-kennisbron.md`](https://github.com/KCTHolman/biohackos/blob/main/docs/governance/rag-kennisbron.md)
+in BiohackOS.
+
 **De plan-critic [opwaardering].** Sinds de auto-ontsteking (mens-poort van plan naar PR
 verschoven) passeert een plan **ongelezen** naar de bouw — het enige station zonder enige
 toets, terwijl een slecht plan het duurste faalpad is (volledige build + review + herstel op
@@ -133,23 +161,34 @@ stuiter aan de voordeur (I19).
 |---|---|---|---|---|
 | `pr-label` | PR open/sync | light | type-/area-/size-labels uit titel + diff | label-drift → project-sync herstelt |
 | `pr-check` | PR open/sync | light → per-area-suites | classificeert de diff en draait **alleen** de geraakte suites (app → flutter; web → node; ci → shell-tests); aggregeert in de required check **`PR check gate`** | rood = blokkade; autofix mag proberen |
-| `feature-governance` | PR open/sync | light | `feat` → GOVERNANCE-blok verplicht (required check **`impactanalyse`**); overige types passeren automatisch | ontbrekend blok = rood, geen uitzonderingen |
-| `pr-review` | PR open/reopen/ready/`needs-review`-label | light (classify) → agent (review) | scope-classifier beslist óf en met welke focus (app/web) gereviewd wordt; `skip-review`-label respecteren; review is **advies met een noodrem** (zie onder) | review-*storing* mag een merge nooit blokkeren; metrics als artifact |
+| `feature-governance` | PR open/sync | light | `feat` → **IA-code** verplicht (required check **`impactanalyse`**): een vaste vragenlijst met vaste antwoorden, gevalideerd tegen de daadwerkelijke diff; overige types passeren automatisch | ontbrekend/kloppend-noch-diff = rood, geen uitzonderingen — zie [`docs/impactanalyse.md`](impactanalyse.md) |
 | `pr-autofix` | workflow_run: PR-check rood | agent | kleine herstelcommits op de PR-branch | niet-triviaal → stoppen, comment, `needs-human` |
 | `pr-conflict-solver` | conflict gedetecteerd (watchdog/event) | agent | rebase/merge-herstel op de PR-branch | onoplosbaar → `needs-human` |
 
-**Reviewbeleid = kostenbeleid:** de classifier bepaalt model en noodzaak (docs-/ci-only kan
-overslaan). Dat is de gemeten kostenreductie-lijn; kwaliteitscompensatie zit in de required
-checks + borg-review-lessen (§8).
+**`feature-governance` is inmiddels gemigreerd** (`.github/workflows/feature-governance.yml`,
+`scripts/check-impact.sh`) — het eerste PR-flow-station na de `pr-label`-pilot. Zie §9 in
+architectuur.md voor waar dat de Fase-3-roadmap raakt.
 
-**Review met een noodrem [opwaardering].** Vandaag is de review zuiver advies: een gevonden
-datalek-achtige fout en een stijl-nit wegen even zwaar (niets). Het hogere ontwerp maakt het
-verdict **gestructureerde data** i.p.v. proza: de review eindigt in `{advies[] , blockers[]}`.
-Advies blijft advies. Maar één of meer `blockers` (concreet: aantoonbare dataverlies-/security-/
-crash-paden, met faal-scenario) zetten het label `review-blocker` → de merge-machine behandelt
-de PR als feature (wacht op mens) tot het label weg is. De rem is smal gedefinieerd en
-adversarieel geformuleerd ("alleen wat je kunt bewijzen"), zodat 'ie zeldzaam blijft — de
-KPI bewaakt de vals-positief-ratio; storing in de review zelf trekt nooit aan de rem (I20).
+**Er is bewust géén `pr-review`-station meer in dit ontwerp.** Tot 2026-08-12 stond hier een
+gepland station — scope-classifier + autonome agent-review, verdict als `{advies[],
+blockers[]}` met een noodrem naar het mens-pad. BiohackOS bouwde dat station (`pr-review.yml`),
+draaide het drie weken in productie, en **schafte het weer af** (PR #2029): de reviewer leverde
+geen bevindingen op bovenop wat de deterministische guards (pr-check, feature-governance,
+drift-doctor) al vingen, terwijl 'ie wél kostte — een agent-lane-slot per app-/website-PR, en
+twee eigen faalmodi die de merge-poort raakten (timeout → `cancelled` in auto-merge's
+fail-teller; een blijvende `CHANGES_REQUESTED` tot dezelfde reviewer toevallig weer approvede).
+Dat is zelf een **idee-4-geval** (README §"Groen is geen bewijs"): een autonome review die
+zelden iets vond, was van buiten niet te onderscheiden van een review die überhaupt niets deed —
+alleen duurder. De reële winst zat al in de deterministische lagen; het advies-station voegde
+kosten toe zonder meetbare kwaliteit.
+
+**Wat wél blijft: de noodrem-infrastructuur (I20).** `noodrem-beslis.sh` is generiek —
+gestructureerde `{advies[], blockers[]}`-verdicts, geen vinkje-of-niet, en review-*storing* zet
+nooit een blocker. Dat mechanisme is niet aan een AI-reviewer gebonden en blijft bruikbare
+machinerie: elke bron die een verdict in die vorm kan opleveren (een gerichter, goedkoper
+gecontroleerd station, of een menselijke reviewer die een structured-comment achterlaat) kan 'm
+voeden. **Kwaliteitscompensatie voor "inhoudelijke zwakte" ligt daarmee bij de mens (mens-poort
+#1) plus de destillatielus (`borg-review-lessen`, §8/§9-H), niet bij een automatische AI-poort.**
 
 ### 3.3 Merge & gitflow-hygiëne
 
@@ -314,7 +353,7 @@ Welke faalklasse wordt door wélk mechanisme gestopt (hard) of gezien (advies):
 | feature zonder impactanalyse | `impactanalyse` | **hard** (required) |
 | registry/spec/CI-drift | `consistency-doctor` | **hard** (required; advies-bevindingen blokkeren niet) |
 | slechte titel (breekt bump/governance/merge) | title-lint + `open-pr.sh` | **hard** bij openen |
-| inhoudelijke zwakte | agent-review | advies — bewust geen poort |
+| inhoudelijke zwakte | menselijke review (mens-poort #1) + `borg-review-lessen` (destillatie) | advies/mens — bewust géén automatische AI-review-poort (BiohackOS-praktijk, PR #2029: leverde niets extra's op boven de deterministische lagen, kostte wel) |
 | verkeerde lane / claude buiten agent-lane | fleet-config-check + lane-scan | **hard** in pr-check |
 | runner-/host-drift | runner-fleet-assert · maintenance-check · diagnostics | melding/issue |
 | gitflow-toestand vergeten | gitflow-doctor + watchdog | zelfherstel, dan `needs-human` |
@@ -414,13 +453,14 @@ per consument voor de agent-runtime. Classic PAT's: uitfaseren (openstaande audi
     zijn geopend** — daar telt alleen een echte approval. "Chore merget op groen" geldt dus alleen
     bij app-auteurschap. Dat is een **gemeten grens van de autonomie, geen storing**; noteer 'm als
     zodanig in plaats van 'm weg te configureren.
-16. **Een verse trigger die de review NIET vernieuwt** → `pr-review` luistert op
-    `opened, reopened, ready_for_review, labeled` en **niet op `synchronize`**. `gh pr update-branch`
-    geeft dus wel een verse check-cyclus maar géén nieuwe review; dismisst de ruleset stale reviews
-    bij nieuwe commits, dan raakt de PR z'n approval kwijt zonder die terug te kunnen krijgen.
-    Vandaar dat de regel luidt "`gh pr update-branch` **+ label/reopen**" — die tweede helft is niet
-    optioneel maar precies het stuk dat de review opnieuw aftrapt (label `needs-review` toevoegen
-    volstaat). Geverifieerd 2026-07-28.
+16. **[historisch, BiohackOS 2026-07-28 — het station bestaat sinds 2026-08-12 niet meer, zie
+    §3.2]** Een verse trigger die de review niet vernieuwt: de toenmalige `pr-review` luisterde op
+    `opened, reopened, ready_for_review, labeled` en **niet op `synchronize`**. `gh pr
+    update-branch` gaf dus wel een verse check-cyclus maar géén nieuwe review; dismisst de ruleset
+    stale reviews bij nieuwe commits, dan raakt de PR z'n approval kwijt zonder die terug te
+    kunnen krijgen. Bewaard omdat het onderliggende GitHub-gedrag (stale-review-dismissal reageert
+    niet op elk PR-event) generiek blijft gelden voor ÉLK toekomstig station dat reviews plaatst —
+    mocht zoiets ooit terugkomen, geldt dezelfde valkuil.
 
 ## 11. Invarianten (voer voor de fleet-doctor)
 

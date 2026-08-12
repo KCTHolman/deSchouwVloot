@@ -66,8 +66,8 @@ lane, en of er een mens in zit.
 | **Plan** | `issue-plan` | triage-akkoord | agent | nee (sinds auto-ontsteking ligt de poort op de PR, niet op het plan) |
 | **Build** | `agent-run` (het huidige `claude.yml`) | plan-akkoord / dispatch | agent | nee |
 | **PR-hygiëne** | `pr-label`, `pr-check` | pull_request | light | nee |
-| **Review** | `pr-review` (scope-classifier + agent-review) | PR-events + `needs-review`-label | light→agent | nee — review is advies, geen poort |
-| **Governance** | `feature-governance` | pull_request | light | indirect: `impactanalyse` is required check |
+| **Review** | mens (approval, mens-poort #1) + `borg-review-lessen` (destillatie) | PR-events / schedule | light→mens | ja, op features — geen automatisch AI-review-station (BiohackOS bouwde en schafte er één af, PR #2029: leverde niets boven de deterministische lagen, kostte wel — zie gitflow.md §3.2) |
+| **Governance** | `feature-governance` (IA-code, gemigreerd) | pull_request | light | indirect: `impactanalyse` is required check |
 | **Herstel** | `pr-autofix`, `pr-conflict-solver` | workflow_run failure / conflict | agent | nee |
 | **Merge** | `auto-merge` | workflow_run groen + review-events | light | **ja, alleen features**: de eigenaar z'n PR-approval; fix/chore/docs/ci mergen op groen |
 | **Epic-cadans** | `epic-orchestrator`, `next-ticket-picker` | meerdere aanjagers | light | nee — de fase-PR's dragen de poort |
@@ -305,7 +305,7 @@ is best-effort, een lege grep mag nooit het rapport afkappen.
 
 | Zone | Wat er draait | Regels |
 |---|---|---|
-| **Untrusted** (PR-/issue-inhoud van buiten de flow) | pr-review, autofix, alles wat vreemde tekst leest | agent-lane-container ÍS de sandbox (geen docker-daemon, geen host-mounts); least-secrets: nooit deploy-/domein-secrets in scope, ook niet via inherit; nooit `pull_request_target` naar self-hosted |
+| **Untrusted** (PR-/issue-inhoud van buiten de flow) | pr-check (container-jobs), autofix, conflict-solver, alles wat vreemde tekst leest | agent-lane-container ÍS de sandbox (geen docker-daemon, geen host-mounts); least-secrets: nooit deploy-/domein-secrets in scope, ook niet via inherit; nooit `pull_request_target` naar self-hosted |
 | **Trusted-automatisch** (main-push, schedule, dispatch) | gitflow, orchestrator, watchdog | app-token i.p.v. brede PAT (zie hieronder); job-permissions minimaal |
 | **Owner** (host-mutaties, repo-settings, release) | registraties, ruleset, production-approve | uitsluitend de eigenaar, via een apart en expliciet gelogd kanaal — nooit vanuit een workflow |
 
@@ -337,7 +337,7 @@ Drie structurele token-besluiten:
 | Wachtrij tot 78 min op 1-slot-lane | Agent-lane heeft nu 2 slots; picker + override als capaciteitsregelaar; KPI bewaakt wachttijd |
 | Auto-merge ↔ workflow_run **naam**-koppeling (beet vanavond bij de rename) | De triggerlijsten zijn caller-bestanden (consument), de doctor-module *consistentie* bewaakt naam↔lijst; optioneel later: één verzamel-"gate"-check zodat auto-merge op één naam luistert |
 | Rerun = oude YAML-snapshot (kostte vanavond bijna een verkeerde architectuurkeuze) | Vast diagnostiek-principe in de watchdog: nooit een fix verifiëren via `gh run rerun`; altijd verse trigger na `update-branch` |
-| Model-kosten | Routering in `.fleet.yml`: sonnet default, opus alleen voor plan-/architectuurstations; de review-scope-classifier (bestaat) bepaalt of een review überhaupt draait |
+| Model-kosten | Routering in `.fleet.yml`: sonnet default, opus alleen voor plan-/architectuurstations. **Bijgesteld (BiohackOS PR #2029, 2026-08-12):** een autonome review-scope-classifier die per PR bepaalde óf een Sonnet-review draaide, is zelf geschrapt — de review vond niets boven de deterministische guards en kostte een agent-lane-slot per PR. Goedkoper én bewezen effectiever: mens-poort + `borg-review-lessen` |
 
 **KPI-set** (nachtelijke metrics-workflow per consument, artifact + wekelijkse retro-issue):
 denials/run · max-turns-ratio · dubbele builds · wachttijd per lane · mens-poort-latency (hoe lang
@@ -370,9 +370,27 @@ raket-logica via callers op `ubuntu-latest` — het veiligste proefkonijn voor h
 bestaat.
 
 **Fase 3 — parametrisering van `[shared]` (18):** eerst het `.fleet.yml`-schema + validator, dan
-één pilot (`pr-label`: kleinste prompt-oppervlak), dan de PR-flow-groep, dan de raket-stations, en
-**`agent-run`/`claude.yml` als allerlaatste** (grootste bestand, elf afnemers). Elke stap: consument
-draait één week op de fleet-versie naast ongewijzigd gedrag vóór de volgende.
+één pilot (`pr-label`: kleinste prompt-oppervlak, **gedaan**), dan de PR-flow-groep, dan de
+raket-stations, en **`agent-run`/`claude.yml` als allerlaatste** (grootste bestand, elf
+afnemers). Elke stap: consument draait één week op de fleet-versie naast ongewijzigd gedrag vóór
+de volgende.
+
+**PR-flow-groep, tussenstand (2026-08-12).** `feature-governance` (de impactanalyse-poort) is
+gemigreerd als tweede station, meteen in z'n bewezen IA-code-vorm — zie `docs/impactanalyse.md`
+en gitflow.md §3.2. Twee dingen die dat sneller maakten dan gepland: (1) het schema-driven
+ontwerp bleek al volledig domeinvrij (`scripts/check-impact.sh` kent geen enkele consument-
+padnaam), dus er was geen aparte parametriseringsstap nodig zoals bij `pr-label`'s
+`.fleet.yml`-`areas:`-uitsplitsing; (2) er was geen `pr-review`-station meer om te migreren — de
+bronrepo schafte dat af vóórdat het hier aan de beurt kwam (zie de Review-rij in §3 hierboven).
+Dat scheelt een station in de PR-flow-groep, niet door hier te versimpelen maar omdat het
+origineel zelf verdween.
+
+**Wat nog wél op de kaart staat voor `agent-run`/`claude.yml` (allerlaatste stap, dus nog ver
+weg, maar het patroon is intussen gevalideerd):** de **RAG-kennisbron** die trap 2/3 gerichte
+context geeft vóór de agent start — zie de nieuwe paragraaf in gitflow.md §3.1. Dat is geen
+Fleet-workflow (het hangt aan de vectorstore/embedding-provider van de consument, en Fleet voegt
+zelf nooit netwerkbestemmingen toe), maar een prompt-partial-patroon dat élke consument met een
+eigen kennisbron kan overnemen zodra deze fase daadwerkelijk begint.
 
 **Fase 4 — Tweede consument als validatie: inmiddels gestart, niet meer alleen een plan.** Een
 tweede project — andere taal, andere stack, volledig op `ubuntu-latest`, geen self-hosted

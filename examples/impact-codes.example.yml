@@ -1,0 +1,97 @@
+# VOORBEELDSCHEMA voor scripts/check-impact.sh — de IA-code van de impactanalyse.
+#
+# WAAROM DIT VOORBEELD ZO IS INGEVULD. Zelfde consument-scenario als
+# `examples/tweede-consument.fleet.yml`: Python-services + Next.js-frontend, alles op
+# GitHub-hosted runners, geen mobiele app. Bewust een ANDERE vorm dan de eerste consument
+# (BiohackOS, waar dit mechanisme vandaan komt en waar het schema wél `mob`/`lib/`/`android/`
+# kent) — dat verschil is het punt: de velden, waarden en padregels zijn consument-eigendom,
+# `scripts/check-impact.sh` zelf kent geen enkele van deze namen.
+#
+# GEBRUIK. Kopieer dit bestand naar `.github/impact-codes.yml` in je eigen repo en pas velden,
+# waarden en `regels:` aan op je eigen mappenindeling. Zie `docs/impactanalyse.md` voor de
+# volledige uitleg van de grammatica en `.github/workflows/feature-governance.yml` voor hoe dit
+# schema wordt aangeroepen (required check `impactanalyse`).
+
+versie: "v1"
+
+velden:
+  # <sleutel>: "<puntnummer>|<label>|<enkel|meervoud>|<toegestane waarden>"
+  "arch": "1|Architectuur & richtlijnen|enkel|conform,uitbreiding,amendement"
+  # Netwerk is meestal de strengste onwrikbare grens van een project (zie constitution/AGENTS.md
+  # van je eigen repo) en verdient daarom een eigen, machine-toetsbaar veld.
+  "net": "1b|Netwerk-bestemming|enkel|geen,bestaand,nieuw"
+  "ux": "2|Design & UX|enkel|nvt,bestaand,nieuw-patroon"
+  "plek": "3|Waar leeft de wijziging|enkel|web,python,beide,ci,data"
+  "db": "4|Databasewijzigingen|enkel|geen,migratie,breaking"
+  "api": "5|Backend/API|enkel|geen,intern,edge-function,extern"
+  "frontend": "6|Next.js-frontend|enkel|geen,component,pagina,nieuwe-pagina"
+  "services": "7|Python-services|enkel|geen,logica,endpoint,nieuwe-service"
+  "herbruik": "8|Herbruikbaarheid|enkel|nvt,hergebruikt,uitgebreid,nieuw"
+  "risico": "9|Security / performance / schaalbaarheid|meervoud|laag,privacy,performance,schaal,hoog"
+  "test": "10a|Tests|meervoud|geen,unit,integratie,zelftest"
+  "docs": "10b|Documentatie|enkel|geen,bijgewerkt,nieuw"
+
+verboden:
+  # Antwoorden die per definitie niet door de poort komen. Vervang `foo.example` door de echte
+  # naam van je project — dit is het enige veld waar de reden een mens overtuigt, niet een script.
+  "net=nieuw": "Een nieuwe netwerk-bestemming is een grondwetswijziging. Een PR kan die niet zelf verlenen: leg het amendement eerst apart voor."
+
+toelichting:
+  # Antwoorden die één regel context vereisen in de PR-body, direct onder het codeblok, als
+  # `- **<sleutel>** — <toelichting>`. Alle overige antwoorden hebben géén proza nodig.
+  - "arch=amendement"
+  - "net=bestaand"
+  - "ux=nieuw-patroon"
+  - "db=migratie"
+  - "db=breaking"
+  - "api=extern"
+  - "frontend=nieuwe-pagina"
+  - "services=nieuwe-service"
+  - "herbruik=nieuw"
+  - "risico=privacy"
+  - "risico=performance"
+  - "risico=schaal"
+  - "risico=hoog"
+  - "test=geen"
+  - "docs=geen"
+
+regels:
+  # --- 3. Waar leeft de wijziging (padregels spiegelen de `areas:` uit .fleet.yml) -----------
+  - "plek=web verbiedt services/*,pyproject.toml,requirements.txt"
+  - "plek=python verbiedt web/*"
+  - "plek=ci verbiedt web/*,services/*"
+  - "plek=data verbiedt web/*,services/*"
+  - "plek=beide vereist web/*"
+  - "plek=beide vereist services/*,pyproject.toml,requirements.txt"
+
+  # --- 4. Database ---------------------------------------------------------------------------
+  - "db=geen verbiedt supabase/migrations/*"
+  - "db=migratie vereist supabase/migrations/*"
+  - "db=breaking vereist supabase/migrations/*"
+
+  # --- 5. Backend/API ------------------------------------------------------------------------
+  - "api=geen verbiedt supabase/functions/*"
+  - "api=edge-function vereist supabase/functions/*"
+
+  # --- 6. Next.js-frontend -------------------------------------------------------------------
+  - "frontend=geen verbiedt web/*"
+  - "frontend=component vereist web/*"
+  - "frontend=pagina vereist web/*"
+  - "frontend=nieuwe-pagina vereist web/*"
+
+  # --- 7. Python-services ---------------------------------------------------------------------
+  - "services=geen verbiedt services/*"
+  - "services=logica vereist services/*"
+  - "services=endpoint vereist services/*"
+  - "services=nieuwe-service vereist services/*"
+
+  # --- 10a. Tests ------------------------------------------------------------------------------
+  - "test=geen verbiedt web/*,services/*"
+  - "test=unit vereist services/tests/*,web/**/*.test.ts"
+  - "test=integratie vereist services/tests/*"
+  - "test=zelftest vereist scripts/*.test.sh"
+
+  # --- 10b. Documentatie -------------------------------------------------------------------------
+  - "docs=geen verbiedt docs/*,*.md"
+  - "docs=bijgewerkt vereist docs/*,*.md"
+  - "docs=nieuw vereist docs/*"
