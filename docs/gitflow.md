@@ -421,12 +421,23 @@ per consument voor de agent-runtime. Classic PAT's: uitfaseren (openstaande audi
     Vandaar dat de regel luidt "`gh pr update-branch` **+ label/reopen**" — die tweede helft is niet
     optioneel maar precies het stuk dat de review opnieuw aftrapt (label `needs-review` toevoegen
     volstaat). Geverifieerd 2026-07-28.
+17. **Een station meldt succes in een comment terwijl de run rood is** → de poort plaatste eerst de
+    comment "📦 Doorgestuurd naar …" en deed daarna pas de transfer. Op 2026-08-13 stond die comment
+    er om 14:40:12; om 14:40:23 gaf `gh issue transfer` een 502 en faalde de run. Het issue bleef
+    liggen mét een melding die succes claimde, en niemand zag dat — een mens leest de comment, niet
+    de status van een run in een andere repo. Regel: **een comment die een uitgevoerde actie
+    beschrijft, komt ná die actie**, en het faalpad corrigeert de melding actief.
+    Tweede val in hetzelfde incident: GitHub gaf 502's op schrijfacties die tóch waren uitgevoerd.
+    Blind opnieuw proberen is dan een tweede uitvoering. Controleer eerst of de vorige poging
+    slaagde (bij een issue kan dat via de permanente redirect op het oude nummer); kan het script
+    dat niet bevestigen, dan is `unverified` het juiste antwoord — niet een gok in één van beide
+    richtingen.
 
 ## 11. Invarianten (voer voor de fleet-doctor)
 
 | # | Invariant | Gecheckt door |
 |---|---|---|
-| I1 | Fleet-workflows hebben uitsluitend `workflow_call`-triggers — **één benoemde uitzondering: `intake.yml`** (de poort hóórt in deFleet's eigen context; er is per definitie geen consument om als caller op te treden). De doctor kent die uitzondering bij naam; élke andere eigen trigger in fleet is een fout | doctor:consistentie |
+| I1 | Fleet-**logica** (een workflow met een eigen `steps:`/`runs-on:`) heeft uitsluitend `workflow_call`-triggers. **Twee uitzonderingen.** (1) `intake.yml`: de poort hóórt in de eigen context van de infra-repo; er is per definitie geen consument om als caller op te treden — de doctor kent die bij naam. (2) **Pure callers** (alle jobs zijn `uses:`-jobs): die hóren juist een eigen trigger te dragen, want een caller zonder trigger draait nooit. De doctor leidt dat af uit het bestand zelf, niet uit een lijst. Élke andere eigen trigger op fleet-logica is een fout. *(Deze formulering staat woord-voor-woord gelijk in [architectuur.md §2](architectuur.md) en in `scripts/fleet-doctor.sh`; drie documenten die dezelfde regel met drie verschillende uitzonderingssets beschreven, was zelf een gedragsrisico.)* | doctor:consistentie |
 | I2 | Elke caller wijst naar een bestaand fleet-pad@ref | doctor:consistentie |
 | I3 | Elke claude-job draait op de agent-lane; geen claude buiten agent | fleet-config-check |
 | I4 | Reusable-call-jobs zijn vrijgesteld van lane-checks (picker kiest, draait zelf licht) | fleet-config-check |
@@ -499,6 +510,20 @@ binnen een dag, maar nooit ongetest bij een consument binnen, en een kapotte fle
 raakt alleen de canary. Dit vervangt het "heroverwegen bij de tweede consument"-besluit door een
 mechanisme. (I24)
 
+Twee dingen die pas bij het bouwen van de handhaver bleken, en die het mechanisme hierboven
+uitbreiden:
+
+**Een pin is niet transitief.** GitHub resolvet elke `uses:`-ref lós. Pin een consument dus op
+`fleet@<sha>`, dan volgt een station dat intern een ánder station aanroept nog steeds `@main` — en
+dat is precies het gedrag dat pinnen moest wegnemen. De geneste refs moeten er dus zélf op.
+
+**Een pin die niet meer opschuift is verstarring, geen veiligheid.** De bump-baan hoort de pin
+binnen een dag door te schuiven; staat een consument een week achter, dan is dat geen "er is iets
+nieuwers" maar "die baan komt er al een week niet doorheen", en dat is een storing in de baan zelf.
+Twee verschillende pins in dezelfde repo is nog erger: een half gelukte bump, waarbij de ene helft
+van de callers andere logica draait dan de andere — een combinatie die per definitie nooit als
+geheel getest is.
+
 ### E. Run-traces naar het lokale warehouse + DORA-frame
 Metrics als losse artifacts zijn leesbaar maar niet **bevraagbaar**. Elke agent-run schrijft één
 gestructureerde trace-regel (station, model, turns, tokens, denials, uitkomst, duur, subject)
@@ -535,7 +560,7 @@ nieuwe infrastructuur: het is een bestand per station, gecureerd door de bestaan
 | I21 | **[opw]** Feature-issues dragen een DoD-blok; feature-PR's mappen criterium→bewijs | poort + merge-machine |
 | I22 | **[opw]** Elke agent-PR bevat een bewijs-artifact | pr-check |
 | I23 | **[opw]** Wijziging aan prompt-partials/stations vereist een groene golden-run. De set moet **grensgevallen met marge 1** bevatten: bestaat 'ie alleen uit 2-0/3-0-gevallen, dan kan geen enkel te breed trefwoord iets kantelen en slaagt de run voor altijd (gemeten 2026-07-28) | golden-run (10 gevallen, 3 op de rand) |
-| I24 | **[opw]** Consumenten pinnen `fleet@SHA`; alleen de canary volgt `@main`; bumps via chore-PR | doctor:consistentie |
+| I24 | **[opw]** Consumenten pinnen `fleet@SHA`; alleen de canary volgt `@main`; bumps via chore-PR. Óók de **geneste** refs (een station dat intern een ander station aanroept), want GitHub resolvet elke `uses:`-ref los en zonder dat is de pin van de consument niet transitief. En een pin die >7 dagen achterloopt is een storing in de bump-baan, geen veiligheid; twee verschillende pins in één repo is een half gelukte bump en per definitie ongetest | doctor:pin |
 | I26 | **[opw]** Een caller verleent minstens de permissies die z'n fleet-workflow nodig heeft (union van workflow- én job-permissies). Een tekort geeft `startup_failure`: de run start niet, er is geen log, en de fout noemt de oorzaak niet — gemeten 2026-07-28 op zeven van de tien callers tegelijk | doctor:permissies |
 | I25 | **[opw]** Geen enkele spine-workflow staat `disabled_manually`/`disabled_inactivity` — een uitgezette motor moet luid melden, niet stil zijn (gemeten 2026-07-28: `auto-merge` stond 10 dagen uit zonder dat iets het merkte) | doctor:spine |
 | I27 | **[opw]** Elke `workflow_run`-luisteraar heeft ná de laatste voltooide run van z'n bron zélf een run gehad (event=`workflow_run`, speling 30 min). **De enige invariant die GEDRAG meet in plaats van configuratie**, en daarmee de enige die stille non-actie ziet: op 2026-07-27 stond alles goed — state, pad, naam, permissies — en gebeurde er tóch tien uur niets. Bewust relatief en niet absoluut: een ouderdomsdrempel in dagen had die tien uur niet gezien | doctor:liveness |
@@ -543,8 +568,27 @@ nieuwe infrastructuur: het is een bestand per station, gecureerd door de bestaan
 
 I23, I27 en I28 zijn drie onafhankelijke gevallen van dezelfde faalklasse — zie
 [README §Groen is geen bewijs](../README.md). Dat ze los van elkaar zijn ontdekt en pas achteraf
-één patroon bleken, is de reden dat het patroon hier expliciet staat: de vierde plek waar het
-opduikt zoek je anders opnieuw van voren af aan.
+één patroon bleken, is de reden dat het patroon hier expliciet staat.
+
+Dat het patroon expliciet opgeschreven staat, betaalt zich uit: het is sindsdien twee keer
+gericht teruggevonden dóór ernaar te zoeken — in beide gevallen vóórdat het schade deed, en beide
+zijn nu machinaal afgedekt.
+
+- **I24 → `doctor:pin`.** De invariant stond toegewezen aan `doctor:consistentie`, en die module
+  toetst het *pad* van een verwijzing, niet de ref erachter. Pin-achterstand viel daar dus buiten.
+  Wat dit een tekstboekgeval van het patroon maakt: achterstand degradeerde naar gróén, omdat een
+  doctor-caller een module die z'n gepinde versie nog niet kent netjes overslaat met een ⚠️. De
+  nieuwe module maakt er een harde bevinding van en meet ook verdeelde pins (twee refs in één repo
+  = half gelukte bump).
+- **I1 → een regressietest met een groot bestand.** `grep -q` sluit de pijp bij de eerste treffer;
+  `sed` krijgt dan SIGPIPE en de pijplijn eindigt onder `set -o pipefail` op 141 — ook al wás er
+  een match. Bij kleine bestanden is sed al klaar vóór grep afsluit, waardoor het alleen bij de
+  zwaarste workflows speelde. `grep -c` lost het op, en de test gebruikt sindsdien bewust een
+  bestand met honderden regels ná de treffer, zodat de fix niet stilletjes terug kan komen.
+
+De werkregel die hieruit volgt en die inmiddels op elke nieuwe guard wordt toegepast: **toets een
+guard één keer tégen de storing die 'm rood hoort te maken.** Een check die nooit rood is geweest,
+is niet aantoonbaar een check.
 
 ---
 

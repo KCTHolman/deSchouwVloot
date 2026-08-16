@@ -141,6 +141,131 @@ else
 ' ' '))"
 fi
 
+
+# --- BESTANDSPADEN ----------------------------------------------------------------------------
+# Zie de uitleg bij stap 0 en 2b in het script. Twee helften, apart getest: WELKE paden staan er in
+# de tekst (puur tekstwerk), en WAT doet een peiling met de uitkomst.
+echo "intake-decide · bestandspaden:"
+
+paden_body="$TMP/paden.md"
+{
+  echo "## Doel"
+  echo "De workflow \`.github/workflows/pr-check.yml\` shardt de tests niet, en"
+  echo "\`lib/features/voeding/dag.dart\` laadt daardoor traag. Zie ook"
+  echo "https://github.com/KCTHolman/BiohackOS/blob/main/docs/plan.md voor de context."
+  echo "Losse woorden als lib/ of README tellen niet mee, net als de/te."
+  echo ""
+  echo "## Acceptatiecriteria"
+  echo "- [ ] De gewijzigde situatie is zichtbaar en meetbaar na de wijziging"
+  echo "- [ ] Er is een test die precies dat geval afdekt en faalt zonder de fix"
+} > "$paden_body"
+
+gevonden="$(bash "$DECIDE" --print-paths --title "Sharden" --body-file "$paden_body" | sort | tr '\n' ' ')"
+verwacht_paden=".github/workflows/pr-check.yml lib/features/voeding/dag.dart "
+if [ "$gevonden" = "$verwacht_paden" ]; then
+  ok "padextractie: alleen echte paden, URL's eruit"
+else
+  bad "padextractie (verwacht '$verwacht_paden', kreeg '$gevonden')"
+fi
+
+# NIET-VERTROUWDE INVOER. Een issue kan door iedereen geopend worden en de peilstap plakt elk pad
+# hieruit in een `gh api repos/<repo>/contents/<pad>`-call. Een `..`-segment laat die peiling buiten
+# de repo klimmen; er is geen legitiem issue dat zo'n pad noemt.
+trav_body="$TMP/traversal.md"
+{
+  echo "Zie ../../../etc/shadow.yml en ook ../../secrets.env.yml voor context."
+  echo "Het echte bestand is lib/app.dart en dat moet gewoon overblijven."
+} > "$trav_body"
+gevonden="$(bash "$DECIDE" --print-paths --title "x" --body-file "$trav_body" | tr '\n' ' ')"
+if [ "$gevonden" = "lib/app.dart " ]; then
+  ok "padextractie weigert \`..\`-segmenten"
+else
+  bad "traversal-pad kwam er doorheen (kreeg '$gevonden')"
+fi
+
+# HET GEVAL WAARVOOR DE PAD-WEGING BESTAAT. Een wijziging aan de éígen pr-check.yml van de
+# productconsument, beschreven met infra-woorden. Zonder peiling wint de infra-repo op
+# trefwoordscore; met peiling wint de repo waar het genoemde bestand écht staat.
+R14="$TMP/routing-paden.yml"
+{
+  echo "consumers:"
+  echo "  - repo: KCTHolman/BiohackOS"
+  echo "    keywords:"
+  echo "      - flutter"
+  echo "  - repo: KCTHolman/fleet"
+  echo "    keywords:"
+  echo "      - workflow"
+  echo "      - runner"
+  echo "      - pijplijn"
+} > "$R14"
+B14="$TMP/body-paden.md"
+{
+  echo "## Doel"
+  echo "De workflow \`.github/workflows/pr-check.yml\` draait de flutter-tests in één keer,"
+  echo "waardoor de pijplijn traag is. De runner staat het grootste deel van de tijd te wachten."
+  echo ""
+  echo "## Acceptatiecriteria"
+  echo "- [ ] De gewijzigde situatie is zichtbaar en meetbaar na de wijziging"
+  echo "- [ ] Er is een test die precies dat geval afdekt en faalt zonder de fix"
+} > "$B14"
+
+beslis_met_paden() { # $1 = paths-file (of leeg) → print de target
+  local pf="${1:-}" args=()
+  [ -n "$pf" ] && args=(--paths-file "$pf")
+  bash "$DECIDE" --title "Tests sharden in de pr-check" --body-file "$B14" \
+    --routing "$R14" "${args[@]}" 2>/dev/null | sed -n 's/^target=//p'
+}
+
+got="$(beslis_met_paden "")"
+[ "$got" = "KCTHolman/fleet" ] \
+  && ok "zonder peiling onveranderd: trefwoorden winnen" \
+  || bad "zonder peiling (verwacht KCTHolman/fleet, kreeg ${got:--})"
+
+P14="$TMP/paths-hit.tsv"
+printf 'KCTHolman/BiohackOS\t.github/workflows/pr-check.yml\n' > "$P14"
+got="$(beslis_met_paden "$P14")"
+[ "$got" = "KCTHolman/BiohackOS" ] \
+  && ok "pad dat alleen bij de consument bestaat verslaat drie infra-trefwoorden" \
+  || bad "pad-weging (verwacht KCTHolman/BiohackOS, kreeg ${got:--})"
+
+# Een pad dat in BEIDE repo's bestaat is geen bewijs vóór één van de twee: iedereen krijgt
+# dezelfde bonus, dus de trefwoorden geven weer de doorslag.
+P14b="$TMP/paths-beide.tsv"
+printf 'KCTHolman/BiohackOS\t.github/workflows/pr-check.yml\nKCTHolman/fleet\t.github/workflows/pr-check.yml\n' > "$P14b"
+got="$(beslis_met_paden "$P14b")"
+[ "$got" = "KCTHolman/fleet" ] \
+  && ok "pad dat overal bestaat beslist niets" \
+  || bad "pad in beide repo's (verwacht KCTHolman/fleet, kreeg ${got:--})"
+
+# Lege peiling (geen enkel pad gevonden, of de peiling was onbetrouwbaar) → oud gedrag.
+P14c="$TMP/paths-leeg.tsv"
+: > "$P14c"
+got="$(beslis_met_paden "$P14c")"
+[ "$got" = "KCTHolman/fleet" ] \
+  && ok "lege peiling valt terug op het oude gedrag" \
+  || bad "lege peiling (verwacht KCTHolman/fleet, kreeg ${got:--})"
+
+# Gelijkspel blijft gelijkspel, óók als de paden het veroorzaken: de poort gokt nooit.
+R14b="$TMP/routing-gelijk.yml"
+{
+  echo "consumers:"
+  echo "  - repo: KCTHolman/BiohackOS"
+  echo "    keywords:"
+  echo "      - flutter"
+  echo "  - repo: KCTHolman/fleet"
+  echo "    keywords:"
+  echo "      - flutter"
+} > "$R14b"
+P14d="$TMP/paths-gelijk.tsv"
+printf 'KCTHolman/BiohackOS\tx/a.yml\nKCTHolman/fleet\tx/a.yml\n' > "$P14d"
+uit="$(bash "$DECIDE" --title "Iets met flutter" --body-file "$B14" --routing "$R14b" \
+        --paths-file "$P14d" 2>/dev/null)"
+if printf '%s' "$uit" | grep -q '^decision=routing'; then
+  ok "gelijkspel mét paden blijft needs-routing"
+else
+  bad "gelijkspel mét paden (kreeg: $(printf '%s' "$uit" | tr '\n' ' '))"
+fi
+
 if [ "$fail" = 0 ]; then
   echo "✅ alle intake-decide-tests groen"
 else

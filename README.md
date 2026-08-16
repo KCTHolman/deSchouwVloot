@@ -42,23 +42,23 @@ gelezen. Komt de permission-denial-ratio van een run boven de drempel, dan opent
 zélf een issue over — van *meten* naar *melden*, zonder dat er een mens hoeft te grasduinen in
 logs om te zien dat er iets structureel scheef staat.
 
-**4. Groen is geen bewijs.** Het derde idee hierboven is een generalisatie van het tweede, en het
-kostte drie afzonderlijke incidenten voordat dat opviel. De gevaarlijkste storing in een pijplijn
-is niet de rode build — die ziet iedereen. Het is de check die **altijd hetzelfde antwoordt** en
-daardoor van buiten niet te onderscheiden is van een check die werkt:
+**4. Groen is geen bewijs.** De gevaarlijkste storing in een pijplijn is niet de rode build — die
+ziet iedereen. Het is de check die **altijd hetzelfde antwoordt** en daardoor van buiten niet te
+onderscheiden is van een check die werkt. Deze pijplijn behandelt dat als een eigen faalklasse, met
+een eigen invariant per instantie:
 
-| | Wat er groen staat | Wat er werkelijk gebeurt |
+| | Waar "groen" misleidend zou zijn | De invariant die het nu vangt |
 |---|---|---|
-| **I23** | de golden-set slaagt | elk geval wint met 3-0, dus geen enkel te breed trefwoord kán iets kantelen — de run slaagt voor altijd |
-| **I27** | trigger, pad, naam en permissies allemaal correct | tien uur lang geen enkele run; de complete spine lag plat |
-| **I28** | de spine "werkt", niets is rood | een station mist een script bij de consument, draait fail-closed, en merget per constructie nooit meer |
+| **I23** | een golden-set waarin elk geval met 3-0 wint, slaagt voor altijd — geen enkel te breed trefwoord kán iets kantelen | de set moet grensgevallen met **marge 1** bevatten, anders bewaakt 'ie niets |
+| **I27** | trigger, pad, naam en permissies allemaal correct, en tóch tien uur lang geen enkele run | meet het **gedrag**: liep de bron, en reageerde de luisteraar erop? |
+| **I28** | een station mist een script bij de consument, draait fail-closed en merget per constructie nooit meer | de eis wordt **uit de stationsdefinitie zelf** afgeleid, niet uit een handlijst die achterloopt |
+| **I24** | een pin die niet opschuift leest als groen, want een doctor-module die de gepinde versie nog niet kent wordt netjes overgeslagen | `doctor:pin` maakt achterstand en verdeelde pins een **harde** bevinding |
 
-Drie keer dezelfde vorm, drie keer los ontdekt, elk met een datum en een gemeten aanleiding. De
-verdediging is telkens hetzelfde principe: **meet het gedrag, niet de configuratie.** I27 doet dat
-letterlijk (liep de bron, en reageerde de luisteraar?). I23 dwingt het af door grensgevallen met
-marge 1 te eisen — een testset waarin alles met 3-0 wint, bewaakt niets. I28 leidt de eis af uit de
-stationsdefinitie zelf in plaats van uit een handmatige lijst, want zo'n lijst loopt achter zonder
-dat iets dat meldt. Zie [docs/gitflow.md §11](docs/gitflow.md).
+Vier keer dezelfde vorm, en dat het patroon één keer benoemd is, is precies waarom de vierde
+gericht gevonden werd in plaats van toevallig. De verdediging is telkens hetzelfde principe: **meet
+het gedrag, niet de configuratie** — en toets elke nieuwe guard één keer tégen de storing die 'm
+rood hoort te maken, want een check die nooit rood is geweest is niet aantoonbaar een check. Zie
+[docs/gitflow.md §11](docs/gitflow.md).
 
 **Waar te beginnen:** [docs/architectuur.md](docs/architectuur.md) is de kaart —
 de vier lagen, de pijplijn met z'n drie mens-poorten, het consumer-contract en het security-model.
@@ -67,7 +67,7 @@ storingsdraaiboek en de machine-checkbare invarianten.
 
 ## Hoe het werkt
 
-Een consument-repo levert een dunne caller van ~15 regels; deze repo levert de logica:
+Een consument-repo levert per station een dunne caller; deze repo levert de logica:
 
 ```yaml
 # in de consument, .github/workflows/checks.yml
@@ -103,11 +103,20 @@ bot-identiteit — geen van beide krijgt een kortere weg. Zie
 Het contract tussen beide is één bestand: [`.fleet.yml`](.fleet.yml). Lanes, poorten, budgetten,
 labelnamen en de "spine" (workflows waarvan uitval *stil* zou zijn). Zie
 [`examples/tweede-consument.fleet.yml`](examples/tweede-consument.fleet.yml) voor hoe datzelfde
-contract eruitziet bij een project met een heel andere vorm — dat was de theorie; inmiddels is de
-proef ook echt gedaan. Sinds afgelopen week draait er een tweede, functioneel geheel ander project
-op de Vloot: andere taal, andere stack, geen self-hosted runner, alleen GitHub-hosted lanes. Geen
-regel fleet-logica geforkt om dat werkend te krijgen — dat is precies de test of de abstractie
-draagt, en die test is nu met een echt project doorstaan, niet alleen met een voorbeeldbestand.
+contract eruitziet bij een project met een heel andere vorm.
+
+Dat begon als theorie en is inmiddels aantoonbaar: er draaien **vier repo's** op de Vloot. Naast de
+productconsument en de infra-repo zelf zijn dat twee projecten met een compleet andere vorm —
+andere taal, andere stack, geen self-hosted runner, alleen GitHub-hosted lanes. Voor geen van beide
+is één regel fleet-logica geforkt. Dat is precies de test of de abstractie draagt: niet of het
+contract *denkbaar* generiek is, maar of een project dat er niet op ontworpen is er zonder
+uitzonderingen in past.
+
+Het schaalt ook de andere kant op. Met vier bestemmingen werd de routeringspoort scherper afgesteld:
+een genoemd **bestandspad** weegt vijf keer een trefwoord, omdat een pad iets zegt over de *plaats*
+en een woord alleen over het *onderwerp* — wie `.github/workflows/pr-check.yml` noemt, verraadt al
+in welke repo 'ie zit. De poort peilt dat pad bij elke consument en telt alleen wat er écht staat;
+lukt die peiling niet volledig, dan wegen paden niet mee en is het gedrag exact als voorheen.
 
 ---
 
@@ -155,7 +164,7 @@ Volledigheid is hier belangrijker dan een schone indruk:
 | Concrete hostcijfers — RAM, schijf, co-hostende diensten | Horen bij één specifieke machine; zeggen niets over het ontwerp en wél iets over waar die machine zwak staat. |
 | Isolatiestatus per lane | Vermeldde per lane of hij al geïsoleerd was of nog niet. Dat is een tijdgebonden statusregel, geen ontwerpkenmerk. |
 | De twee callers met echte triggers | `pull_request`/`schedule`-callers. Hun inhoud is het lezen waard, hun trigger niet. |
-| Domeintrefwoorden van de productconsument in `routing.yml` | Vervangen door neutrale voorbeelden. Dit is de énige plek waar projectkennis in de poort zit — dat is meteen het ontwerpargument: de rest van de machinerie is domeinvrij en dus deelbaar. |
+| Domeintrefwoorden en twee van de vier consumenten in `routing.yml` | Vervangen door neutrale voorbeelden; de tabel hier toont twee bestemmingen in plaats van vier. Dit is de énige plek waar projectkennis in de poort zit — dat is meteen het ontwerpargument: de rest van de machinerie is domeinvrij en dus deelbaar. De routeringslogica in `scripts/intake-decide.sh` is wél volledig, inclusief de pad-weging, en de golden-set toetst 'm op de tabel die hier staat. |
 | Interne draaiboek-verwijzingen | Wezen naar documenten in privérepo's; als link waardeloos, als bestandsnaam soms verklappend. |
 
 Drie wijzigingen in [`.github/workflows/intake.yml`](.github/workflows/intake.yml) zijn geen
@@ -193,6 +202,13 @@ bash scripts/fleet-doctor.sh --module consistentie --root .
 
 # I28: eist een aangeroepen station een script dat déze repo niet heeft?
 bash scripts/fleet-doctor.sh --module afhankelijkheden --root . --fleet-root .
+
+# I24: staat een consument te ver achter, of draagt 'ie twee verschillende pins?
+bash scripts/fleet-doctor.sh --module pin --root .
+
+# welke modules kent déze versie? (zodat een gepinde consument een typefout van
+# pin-scheefstand kan onderscheiden — twee dingen die er van binnenuit identiek uitzien)
+bash scripts/fleet-doctor.sh --module modules
 
 # en het bewijs dat niets hier uit zichzelf kan vuren
 bash scripts/check-no-triggers.sh

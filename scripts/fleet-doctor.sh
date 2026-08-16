@@ -11,6 +11,7 @@
 #   scripts/fleet-doctor.sh --module runners      --repo <owner/naam>
 #   scripts/fleet-doctor.sh --module liveness     --repo <owner/naam> [--grace-min 30]
 #   scripts/fleet-doctor.sh --module afhankelijkheden --root . --fleet-root <checkout van deze repo>
+#   scripts/fleet-doctor.sh --module pin          [--root .] [--pin-drempel-dagen 7]
 #
 # `consistentie` is puur bestandsgebaseerd → offline testbaar (fleet-doctor.test.sh). `spine`,
 # `runners` en `liveness` bevragen de GitHub-API en hebben `gh` + GH_TOKEN nodig; van `liveness`
@@ -31,6 +32,11 @@ spine_list="auto-merge.yml,pr-check.yml,epic-orchestrator.yml,reconciler-cron.ym
 # Speling tussen "de bron is klaar" en "de luisteraar is begonnen". Ruim genoeg dat een run die
 # NET voltooide geen vals alarm geeft, krap genoeg dat een dode trigger binnen het uur opvalt.
 grace_min=30
+# Hoeveel dagen een consument-pin achter het hoofd van deze repo mag lopen vóór het een harde
+# bevinding is (I24). Bewust ruim: de bump-baan opent per nieuwe groene canary-commit een PR, dus
+# zeven dagen achterstand betekent niet "er is iets nieuwers" maar "die baan komt er al een week
+# niet doorheen".
+pin_drempel=7
 
 die() { echo "✋ fleet-doctor: $*" >&2; exit 2; }
 
@@ -42,6 +48,7 @@ while [ $# -gt 0 ]; do
     --fleet-repo) shift; fleet_repo="${1:-}" ;;
     --spine)      shift; spine_list="${1:-}" ;;
     --grace-min)  shift; grace_min="${1:-}" ;;
+    --pin-drempel-dagen) shift; pin_drempel="${1:-}" ;;
     # Pad naar een checkout van DEZE repo naast die van de consument. I28 leest de eis uit de
     # stationsdefinities zelf, zodat er geen handmatige lijst is die achterloopt. In doctor.yml
     # staat die checkout al klaar als `.fleet-doctor`.
@@ -90,7 +97,15 @@ module_consistentie() {
       [ "$(printf '%s' "$triggers" | tr -d ' ')" = "workflow_call" ] && continue
 
       # Eigen trigger gevonden — draagt dit bestand eigen logica of is het een pure caller?
-      if sed -E 's/(^|[[:space:]])#.*$//' "$f" | grep -qE '^\s{4}(steps:|runs-on:)'; then
+      #
+      # `grep -c` EN NIET `grep -q`. `-q` stopt bij de eerste treffer en sluit de pijp; `sed` krijgt
+      # dan SIGPIPE en de pijplijn eindigt onder `set -o pipefail` op 141 — ook al wás er een match.
+      # Dat speelt alleen bij grote bestanden, want daar heeft sed nog werk liggen als grep al klaar
+      # is. `-c` leest de invoer uit en telt, en is daarmee ongevoelig voor die race.
+      # `fleet-doctor.test.sh` houdt dit vast met een regressiegeval van 800 regels.
+      local heeft_logica
+      heeft_logica="$(sed -E 's/(^|[[:space:]])#.*$//' "$f" | grep -cE '^\s{4}(steps:|runs-on:)' || true)"
+      if [ "${heeft_logica:-0}" -gt 0 ]; then
         bad "I1: $base draagt eigen logica MÉT eigen trigger ($triggers) — fleet-logica mag alleen workflow_call"
         i1=1
       fi
@@ -378,13 +393,45 @@ module_liveness() {
     l_epoch=0; [ -n "$l_iso" ] && l_epoch="$(date -u -d "$l_iso" +%s 2>/dev/null || echo 0)"
 
     # Nieuwste voltooide run over álle bronnen samen: reageren hóórt op elk van hen.
-    local b_epoch=0 b_naam="" pad b_iso e
+    #
+    # MAAR: niet elke bron-run KÁN een workflow_run-event afgeven. GitHub's recursie-slot smoort de
+    # vervolg-events van een run die met de GITHUB_TOKEN is aangezwengeld ("events triggered by the
+    # GITHUB_TOKEN will not create a new workflow run") — in de praktijk een `workflow_dispatch`
+    # vanuit een andere workflow, herkenbaar aan actor `github-actions[bot]`. De luisteraar kán op
+    # zo'n run niet reageren, dus 'm afrekenen op die stilte is per constructie vals alarm.
+    #
+    # Geverifieerd bij een consument (2026-08-01): runs via `issues` (actor `claude[bot]` of een
+    # mens) gaven élke keer een vervolgrun; drie opeenvolgende `workflow_dispatch`-runs door
+    # `github-actions[bot]` géén enkele. Omdat juist de raket die dispatch-route continu gebruikt,
+    # wás de nieuwste bron-run bijna altijd zo'n gesmoorde — I27 stond daardoor permanent hard
+    # rood, en via de fail-teller van auto-merge hield dat de complete merge-poort dicht.
+    #
+    # EN: een bron-run die NÉT is afgerond kan nog geen reactie hebben. De speling hieronder vangt
+    # dat alleen als de luisteraar kórt vóór de bron draaide; stond z'n vorige run langer terug —
+    # volkomen normaal, er liep in de tussentijd simpelweg geen bron — dan las I27 een reactie die
+    # nog in de maak was als een dode trigger. Gemeten 2026-08-01: de bron rondde af om 09:17:09,
+    # de reactie erop ontstond om 09:17:11, en de doctor las de luisteraarslijst net dáárvoor →
+    # hard rood op een keten die perfect werkte.
+    #
+    # Daarom tellen alleen bron-runs mee die minstens één speling geleden AFRONDDEN (`updated_at`).
+    # Samen met de actor-filter: de nieuwste voltooide bron-run die het event WÉL kón afgeven én
+    # lang genoeg geleden is om een reactie te verwachten. Blijft er niets over, dan blijft $b_iso
+    # leeg → oordeel `geen-bron` (zacht), niet hard rood.
+    local b_epoch=0 b_naam="" pad b_iso e nu
+    nu="$(date -u +%s)"
     while IFS= read -r nm; do
       [ -n "$nm" ] || continue
       pad="$(printf '%s' "$naar_pad" | grep -F "$nm	" | head -1 | cut -f2)"
       [ -n "$pad" ] || continue
-      b_iso="$(gh api "repos/$repo/actions/workflows/$pad/runs?status=completed&per_page=1" \
-        --jq '.workflow_runs[0].created_at // ""' 2>/dev/null)" || b_iso=""
+      b_iso="$(gh api "repos/$repo/actions/workflows/$pad/runs?status=completed&per_page=50" \
+        --jq '.workflow_runs[]? | select((.actor.login // "") != "github-actions[bot]")
+              | "\(.created_at)\t\(.updated_at // .created_at)"' 2>/dev/null \
+        | while IFS="$(printf '\t')" read -r b_c b_u; do
+            [ -n "$b_u" ] || continue
+            ue="$(date -u -d "$b_u" +%s 2>/dev/null || echo 0)"
+            [ "$ue" -gt 0 ] || continue
+            if [ "$((nu - ue))" -ge "$grace" ]; then printf '%s\n' "$b_c"; break; fi
+          done)" || b_iso=""
       [ -n "$b_iso" ] || continue
       e="$(date -u -d "$b_iso" +%s 2>/dev/null || echo 0)"
       [ "$e" -gt "$b_epoch" ] && { b_epoch="$e"; b_naam="$nm"; }
@@ -410,6 +457,120 @@ module_liveness() {
   elif [ "$hard" = 0 ]; then
     ok "I27: $bewezen van $gecontroleerd luisteraars bewezen; de rest staat hierboven als ⚠️"
   fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# MODULE pin — I24. Een pin die niet meer opschuift is verstarring, niet veiligheid.
+# ---------------------------------------------------------------------------------------------
+#
+# WAT DEZE MODULE TOEVOEGT. I24 werd eerder afgedekt door `doctor:consistentie`, en die module
+# toetst het PÁD van een verwijzing — niet de ref erachter. Pin-achterstand viel daar dus buiten.
+# Dat is een subtiel gat: een achterlopende pin leest van buiten als GROEN, omdat doctor.yml een
+# module die de gepinde doctor nog niet kent netjes overslaat met een ⚠️. Zachte degradatie is
+# precies goed voor scheefstand, maar zonder tegenhanger zou "meer achterstand" tot "minder harde
+# bevindingen" leiden. Deze module is die tegenhanger.
+#
+# Twee dingen worden hier hard:
+#   • ACHTERSTAND — de gepinde commit is ouder dan de drempel t.o.v. het hoofd van deze repo. Niet
+#     "er is een nieuwere commit" (dan zou élke push elke consument rood zetten), maar "de
+#     bump-baan is er al dagen niet in geslaagd 'm door te schuiven", en dát is een storing in de
+#     baan zelf.
+#   • VERDEELDHEID — meer dan één distinct SHA in dezelfde repo. Dat is een half gelukte bump: de
+#     ene helft van de callers roept nieuwe logica aan, de andere oude. Dat is geen achterstand
+#     maar inconsistentie, en die is per definitie ongetest.
+
+# Pure beslisser, zelfde patroon als liveness_oordeel: geen netwerk, geen klok, alles als argument.
+#   $1 = epoch van de gepinde commit (0 = onbekend)
+#   $2 = epoch van de hoofdcommit van deze repo (0 = onbekend)
+#   $3 = drempel in dagen
+#   $4 = aantal distinct SHA-refs in de repo
+pin_oordeel() {
+  local gepind="${1:-0}" hoofd="${2:-0}" drempel="${3:-7}" n_refs="${4:-0}"
+  [ "$n_refs" -gt 1 ] && { echo "verdeeld"; return; }
+  [ "$n_refs" -eq 0 ] && { echo "ongepind"; return; }
+  # Niet kunnen meten is geen bevinding. Een SHA die de API niet teruggeeft (force-push, andere
+  # repo) moet zichtbaar zijn als "onbekend", niet als "verouderd" — anders is de eerste keer dat
+  # deze module iets zegt meteen een vals alarm.
+  { [ "$gepind" -eq 0 ] || [ "$hoofd" -eq 0 ]; } && { echo "onbekend"; return; }
+  if [ "$((hoofd - gepind))" -gt "$((drempel * 86400))" ]; then echo "verouderd"; else echo "actueel"; fi
+}
+
+module_pin() {
+  [ -d "$wf_dir" ] || { warn "geen $wf_dir — niets te controleren"; return; }
+
+  # GEEN `gh`-guard hier, bewust. Het grootste deel van deze module is BESTANDSWERK (is dit de
+  # kanarie? staan er twee verschillende pins?) en dat hoort ook zonder netwerk een uitspraak te
+  # geven. Alleen de ouderdomsvraag heeft de API nodig; die degradeert verderop naar `onbekend`.
+  # Andersom — vooraf afbreken op een ontbrekende `gh` — zou de verdeeldheidscheck, de enige die
+  # een half gelukte bump ziet, uitzetten op precies de machine waar je 'm offline wilt draaien.
+  local is_fleet=0
+  [ -f "$root/docs/architectuur.md" ] && [ -f "$root/routing.yml" ] && is_fleet=1
+  if [ "$is_fleet" = 1 ]; then
+    # Deze repo is zelf de KANARIE (gitflow §13.D): die hóórt zichzelf op `@main` te volgen, anders
+    # test 'ie niet de nieuwste commit maar zichzelf. Hier iets van vinden zou de invariant omdraaien.
+    ok "I24: deze repo is de kanarie — volgt \`@main\` en heeft per ontwerp geen pin"
+    return
+  fi
+
+  # Zelfde ont-hardcodering als I28: via $fleet_repo, met geëscapete punten. Een hardgecodeerde
+  # repo-naam laat deze module onder een andere naam stilzwijgend niets vinden en dus altijd ✅
+  # melden — de faalvorm die deze module nou juist aan de kaak stelt.
+  local repo_re alle refs branches
+  repo_re="$(printf '%s' "$fleet_repo" | sed 's/[.[\*^$]/\\&/g')"
+  alle="$(grep -rhoE "$repo_re/\.github/workflows/[A-Za-z0-9_.-]+\.yml@[A-Za-z0-9_.:/-]+" \
+    "$wf_dir" 2>/dev/null | sed -E 's/.*@//' | sort -u)"
+  if [ -z "$alle" ]; then
+    ok "I24: deze repo roept geen stations van $fleet_repo aan — niets te pinnen"
+    return
+  fi
+  # SHA's scheiden van branch-/tagnamen: alleen een volle 40-hex is een echte pin.
+  refs="$(printf '%s\n' "$alle" | grep -xE '[0-9a-f]{40}' || true)"
+  branches="$(printf '%s\n' "$alle" | grep -vxE '[0-9a-f]{40}' || true)"
+
+  local n_refs=0
+  [ -n "$refs" ] && n_refs="$(printf '%s\n' "$refs" | grep -c . || true)"
+
+  # De bump-baan (`bump-pin.yml`) volgt bewust `@main` — dat is de ontpin-knop, geen scheefstand.
+  # Elke ándere branch-ref is er wel één: die caller beweegt mee met elke push naar deze repo.
+  if [ -n "$branches" ]; then
+    local losse
+    losse="$(grep -rlE "$repo_re/\.github/workflows/[A-Za-z0-9_.-]+\.yml@(main|master)" "$wf_dir" 2>/dev/null \
+      | xargs -r -n1 basename | grep -v '^bump-pin\.yml$' | tr '\n' ' ' || true)"
+    [ -n "$(printf '%s' "$losse" | tr -d ' ')" ] \
+      && warn "I24: deze caller(s) volgen een branch i.p.v. een SHA: $losse — elke push naar $fleet_repo landt daar ongetest"
+  fi
+
+  # Datums ophalen. De bronrepo kan privé zijn, dus dit vraagt een app-token; die staat als
+  # FLEET_TOKEN in de omgeving (doctor.yml zet 'm). Zonder token is dit niet meetbaar — en dat
+  # zeggen we, in plaats van het als achterstand te lezen.
+  local tok="${FLEET_TOKEN:-${GH_TOKEN:-}}"
+  local gepind_sha hoofd_sha="" gepind_iso="" hoofd_iso="" gepind_e=0 hoofd_e=0
+  gepind_sha="$(printf '%s\n' "$refs" | head -1)"
+  if command -v gh >/dev/null && [ -n "$gepind_sha" ]; then
+    gepind_iso="$(GH_TOKEN="$tok" gh api "repos/$fleet_repo/commits/${gepind_sha}" \
+      --jq '.commit.committer.date // ""' 2>/dev/null || true)"
+    hoofd_iso="$(GH_TOKEN="$tok" gh api "repos/$fleet_repo/commits/main" \
+      --jq '.commit.committer.date // ""' 2>/dev/null || true)"
+    hoofd_sha="$(GH_TOKEN="$tok" gh api "repos/$fleet_repo/commits/main" --jq '.sha // ""' 2>/dev/null || true)"
+  fi
+  [ -n "$gepind_iso" ] && gepind_e="$(date -u -d "$gepind_iso" +%s 2>/dev/null || echo 0)"
+  [ -n "$hoofd_iso" ]  && hoofd_e="$(date -u -d "$hoofd_iso" +%s 2>/dev/null || echo 0)"
+
+  local dagen=0
+  [ "$gepind_e" -gt 0 ] && [ "$hoofd_e" -gt 0 ] && dagen=$(( (hoofd_e - gepind_e) / 86400 ))
+
+  case "$(pin_oordeel "$gepind_e" "$hoofd_e" "$pin_drempel" "$n_refs")" in
+    ongepind)
+      warn "I24: geen enkele SHA-pin gevonden — deze consument volgt een branch. Pinnen is de eis; de bump-baan schuift 'm daarna vanzelf door" ;;
+    verdeeld)
+      bad "I24: $n_refs VERSCHILLENDE pins in dezelfde repo ($(printf '%s' "$refs" | tr '\n' ' ')) — een half gelukte bump. De ene helft van de callers draait andere logica dan de andere, en die combinatie is nooit als geheel getest" ;;
+    onbekend)
+      warn "I24: kon de datum van pin \`${gepind_sha:0:7}\` of van het hoofd van $fleet_repo niet ophalen — achterstand ongetoetst (token/rechten?)" ;;
+    verouderd)
+      bad "I24: de pin \`${gepind_sha:0:7}\` is $dagen dagen ouder dan het hoofd \`${hoofd_sha:0:7}\` (drempel $pin_drempel). Niet 'er is iets nieuwers' — de bump-baan had dit al lang moeten doorschuiven, dus die baan is zelf stuk of staat uit" ;;
+    actueel)
+      ok "I24: pin \`${gepind_sha:0:7}\` loopt $dagen dag(en) achter op het hoofd — binnen de drempel van $pin_drempel" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -508,7 +669,8 @@ spine
 runners
 contract
 liveness
-afhankelijkheden"
+afhankelijkheden
+pin"
 
 case "$module" in
   consistentie) echo "── fleet-doctor · consistentie (I1/I2/I5/I7) ──"; module_consistentie ;;
@@ -518,9 +680,13 @@ case "$module" in
   contract)     echo "── fleet-doctor · contract (.fleet.yml) ──";      module_contract ;;
   liveness)     echo "── fleet-doctor · liveness (I27) ──";             module_liveness ;;
   afhankelijkheden) echo "── fleet-doctor · afhankelijkheden (I28) ──";  module_afhankelijkheden ;;
+  pin)          echo "── fleet-doctor · pin (I24) ──";                 module_pin ;;
   # Verborgen haak: laat de test de PURE beslisser aanroepen zonder netwerk of klok.
   #   --module liveness-oordeel --repo "<bron_epoch> <luisteraar_epoch> <grace_sec>"
   liveness-oordeel) liveness_oordeel $repo ;;
+  # Zelfde verborgen haak voor de pin-beslisser:
+  #   --module pin-oordeel --repo "<gepind_epoch> <hoofd_epoch> <drempel_dagen> <aantal_refs>"
+  pin-oordeel)  pin_oordeel $repo ;;
   # Laat de aanroeper vragen WAT deze versie kent. Zonder dit kan een gepinde consument het
   # verschil niet zien tussen een typefout en pin-scheefstand — zie de kop van dit blok.
   modules)      printf '%s

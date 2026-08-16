@@ -7,6 +7,14 @@
 #
 # Gebruik:
 #   scripts/intake-decide.sh --title "..." --body-file body.md [--routing routing.yml]
+#                            [--paths-file gepeild.tsv] [--path-weight 5]
+#   scripts/intake-decide.sh --print-paths --title "..." --body-file body.md
+#
+# `--print-paths` drukt de bestandspaden af die in de tekst genoemd worden, één per regel, en stopt
+# daarna. Dat is bewust een aparte aanroep: WELKE paden genoemd worden is puur tekstwerk en dus
+# hier testbaar; of ze ergens BESTAAN is een API-vraag en hoort in de workflow. Die peilt ze en
+# geeft het resultaat als `--paths-file` terug (regels `owner/repo<TAB>pad`). Zelfde splitsing als
+# bij `liveness-oordeel` in fleet-doctor.sh: de workflow verzamelt, het script beslist.
 #
 # Uitvoer op stdout, machine-leesbaar (key=value per regel):
 #   decision=detail|routing|transfer
@@ -27,14 +35,24 @@ set -euo pipefail
 title=""
 body_file=""
 routing="routing.yml"
+paths_file=""
+print_paths=0
+# Hoeveel een genoemd bestandspad weegt tegenover één trefwoord. Zie de uitleg bij stap 2b.
+path_weight=5
+# Hoeveel padkandidaten we maximaal aanbieden. De peiling erbuiten kost een API-call per pad per
+# consument; vijf paden dekt elk realistisch issue en houdt dat begrensd.
+max_paths=5
 
 die() { echo "✋ intake-decide: $*" >&2; exit 2; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --title)     shift; title="${1:-}" ;;
-    --body-file) shift; body_file="${1:-}" ;;
-    --routing)   shift; routing="${1:-}" ;;
+    --title)       shift; title="${1:-}" ;;
+    --body-file)   shift; body_file="${1:-}" ;;
+    --routing)     shift; routing="${1:-}" ;;
+    --paths-file)  shift; paths_file="${1:-}" ;;
+    --path-weight) shift; path_weight="${1:-}" ;;
+    --print-paths) print_paths=1 ;;
     *) die "onbekend argument: $1" ;;
   esac
   shift
@@ -43,9 +61,41 @@ done
 [ -n "$title" ]      || die "--title ontbreekt"
 [ -n "$body_file" ]  || die "--body-file ontbreekt"
 [ -f "$body_file" ]  || die "body-bestand bestaat niet: $body_file"
-[ -f "$routing" ]    || die "routeringstabel bestaat niet: $routing"
 
 body="$(cat "$body_file")"
+
+# --- 0. Padkandidaten uit de tekst ------------------------------------------------------------
+# Een bestandspad is veel specifieker bewijs dan een los woord: wie `.github/workflows/pr-check.yml`
+# noemt, weet al in welke repo 'ie zit. Alleen paden MET een map-scheiding én een extensie tellen —
+# `README` of `de/te` zijn geen bewijs, `lib/features/x.dart` wel.
+#
+# URL's gaan er eerst uit: `https://github.com/<owner>/<repo>/blob/main/lib/x.dart` zou anders als
+# vijf losse "paden" binnenkomen.
+#
+# GEEN `..`-SEGMENTEN. De uitkomst hiervan is niet-vertrouwde tekst: iedereen met een GitHub-account
+# kan een issue openen, en de workflow plakt elk pad hieruit in `gh api repos/<repo>/contents/<pad>`.
+# Een pad als `../../../etc/shadow.yml` haalt de tekenklasse hieronder moeiteloos (punt en slash
+# zitten erin) en laat de peiling dan buiten `contents/` klimmen. Er is geen enkele legitieme reden
+# dat een issue naar een pad búiten de repo wijst, dus die gaan er hier uit — bij de bron, zodat
+# elke aanroeper van dit script de grens erft in plaats van 'm zelf te moeten leggen.
+paden="$(printf '%s\n%s' "$title" "$body" \
+  | sed -E 's#https?://[^[:space:])"]*##g' \
+  | grep -oE '[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+' \
+  | grep -E '/[A-Za-z0-9_.-]+\.[A-Za-z0-9]+$' \
+  | sed -E 's#^\./##' \
+  | grep -vE '(^|/)\.\.(/|$)' \
+  | sort -u | head -"$max_paths" || true)"
+# `|| true` is hier geen slordigheid: `grep` geeft exit 1 als er niets matcht, en dit script draait
+# met `set -e -o pipefail`. Zonder die vangnet-clausule zou ELK issue zónder bestandspad — verreweg
+# de meeste — het script laten sterven vóór de routering, en de poort geeft dan geen beslissing meer.
+
+if [ "$print_paths" = 1 ]; then
+  [ -n "$paden" ] && printf '%s\n' "$paden"
+  exit 0
+fi
+
+# Pas hierna, zodat `--print-paths` geen routeringstabel nodig heeft: die aanroep doet puur tekstwerk.
+[ -f "$routing" ]    || die "routeringstabel bestaat niet: $routing"
 
 emit() {
   printf 'decision=%s\n' "$1"
@@ -118,7 +168,7 @@ pairs="$(awk '
 
 repos="$(printf '%s\n' "$pairs" | cut -f1 | awk '!seen[$0]++')"
 
-best_repo=""; best_score=0; runner_up=0
+best_repo=""; best_score=0; runner_up=0; best_paden=0
 while IFS= read -r repo; do
   [ -n "$repo" ] || continue
   score=0
@@ -130,8 +180,35 @@ while IFS= read -r repo; do
   done <<EOF
 $(printf '%s\n' "$pairs" | awk -F'\t' -v r="$repo" '$1==r {print $2}')
 EOF
+
+  # --- 2b. Bestandspaden wegen zwaarder dan losse trefwoorden ---------------------------------
+  # AANLEIDING, gemeten. Een issue over een wijziging aan de éígen `pr-check.yml` van de
+  # productconsument werd op trefwoordscore 6-2 naar de infra-repo zelf gerouteerd, omdat woorden
+  # als "workflow" en "runner" nu eenmaal infra-woorden zijn. Daar gebeurde vervolgens niets: die
+  # repo heeft geen raket, dus het issue lag 20+ minuten stil zonder label of signaal en moest
+  # handmatig verhuizen.
+  #
+  # Het bewijs lág in het issue: de infra-repo HEEFT geen `pr-check.yml`, de consument wel. Losse
+  # woorden zeggen alleen iets over het ONDERWERP; een bestandspad zegt iets over de PLAATS.
+  # Vandaar dat een treffer hier zwaarder telt dan welk trefwoord dan ook — maar niet absoluut:
+  # overweldigend trefwoordbewijs kan 'm nog steeds verslaan, en een gelijkspel blijft gewoon
+  # `needs-routing`.
+  #
+  # PER DISTINCT PAD, niet één bonus per repo. Een pad dat in álle repo's bestaat (`docs/x.md`)
+  # verhoogt iedereen even hard en beslist dus niets — precies goed. Noemt een issue twee paden
+  # waarvan er één maar in één repo staat, dan hoort díé repo voor te komen.
+  #
+  # Geen peiling meegekregen (of de peiling was onbetrouwbaar) → deze stap doet niets en het
+  # gedrag is byte-voor-byte het oude. De workflow laat het bestand dan bewust weg.
+  pad_treffers=0
+  if [ -n "$paths_file" ] && [ -f "$paths_file" ]; then
+    pad_treffers="$(awk -F'\t' -v r="$repo" '$1==r && $2 != "" {print $2}' "$paths_file" \
+      | sort -u | grep -c . || true)"
+    score=$((score + pad_treffers * path_weight))
+  fi
+
   if [ "$score" -gt "$best_score" ]; then
-    runner_up="$best_score"; best_score="$score"; best_repo="$repo"
+    runner_up="$best_score"; best_score="$score"; best_repo="$repo"; best_paden="$pad_treffers"
   elif [ "$score" -gt "$runner_up" ]; then
     runner_up="$score"
   fi
@@ -147,4 +224,8 @@ if [ "$best_score" -eq "$runner_up" ]; then
   emit routing "" "Meerdere projecten passen even goed (score $best_score gelijk) — ik gok niet. Kies zelf het doelproject."
 fi
 
-emit transfer "$best_repo" "Eenduidig gerouteerd naar \`$best_repo\` (score $best_score tegen $runner_up)."
+pad_uitleg=""
+if [ "$best_paden" -gt 0 ]; then
+  pad_uitleg=" — waarvan $((best_paden * path_weight)) punt(en) uit $best_paden genoemd bestandspad(en) die daar écht bestaan"
+fi
+emit transfer "$best_repo" "Eenduidig gerouteerd naar \`$best_repo\` (score $best_score tegen $runner_up)$pad_uitleg."

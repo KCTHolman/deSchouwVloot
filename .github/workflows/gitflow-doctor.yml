@@ -84,6 +84,10 @@ jobs:
       EXCLUDE_PATHS: ".github/workflows/pr-check.yml .github/workflows/pr-autofix.yml .github/workflows/claude.yml .github/workflows/auto-merge.yml .github/workflows/pr-conflict-solver.yml .github/workflows/release.yml .github/workflows/promote-release.yml .github/workflows/gitflow-doctor.yml"
       MAX_CHORES: "3"
       WINDOW_MIN: "1560" # ~26u: alleen recente storingen; oudere zijn vermoedelijk al opgelost/gemeld
+      # Hoe lang een GESLOTEN gitflow-fix-issue nog dedupliceert. Zie de uitleg bij
+      # `recent_closed_titles` hieronder: korter en de herhaal-spam komt terug, langer en een
+      # storing die écht terugkeert blijft te lang onzichtbaar.
+      CLOSED_DEDUP_DAYS: "7"
     steps:
       # Checkout nodig sinds fase 3 (epic #1168): de B1/B2-guards draaien als scripts uit de repo
       # (scripts/check-zombie-workflows.sh + scripts/check-fleet-config.sh). De failure-scan
@@ -122,6 +126,50 @@ jobs:
           open_titles="$(gh issue list --repo "$REPO" --state open --label gitflow-fix \
             --json title --jq '.[].title' 2>/dev/null || true)"
 
+          # ...ÉN de kortgeleden GESLOTEN gitflow-fix-issues.
+          #
+          # Dedup op alleen open issues heeft een gat precies daar waar het pijn doet: sluit het
+          # tracking-issue (handmatig, of doordat de fix-PR 'm merget) terwijl de storing nog
+          # terugkomt, dan vindt de eerstvolgende sweep dezelfde workflow terug en opent 'm opnieuw.
+          # Gemeten bij een consument: 8× hetzelfde triage-issue in 3 dagen, 5× dezelfde
+          # agent-workflow, 4× dezelfde scan op één dag. Elke herhaling herstart de volle raket op
+          # hetzelfde symptoom, dus dit is geen cosmetische ruis maar echte agent-tijd op een al
+          # bekend probleem.
+          #
+          # De ALREADY-HEALED-GUARD verderop dekt dit NIET: die kijkt of een látere run slaagde. Bij
+          # een storing die blijft terugkomen is er geen geslaagde run, dus die guard laat 'm netjes
+          # door — precies het geval dat hier vastloopt.
+          #
+          # Waarom een venster en geen permanente dedup: keert de storing ná dat venster terug, dan
+          # is dat vers bewijs dat de vorige fix niet werkte, en dan hoort er wél een nieuw issue te
+          # komen. Zeven dagen is lang genoeg om een reeks van dagen te dempen en kort genoeg om een
+          # echte terugval niet te verbergen.
+          #
+          # `closedAt` is ISO-8601 in UTC (…Z), dus de string-vergelijking in jq is meteen de
+          # chronologische — geen datum-rekenwerk in jq nodig, alleen een cutoff van `date`.
+          closed_cutoff="$(date -u -d "-${CLOSED_DEDUP_DAYS} days" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+          recent_closed_titles=""
+          if [ -n "$closed_cutoff" ]; then
+            recent_closed_titles="$(gh issue list --repo "$REPO" --state closed --label gitflow-fix \
+              --limit 100 --json title,closedAt \
+              --jq "[.[] | select((.closedAt // \"\") >= \"$closed_cutoff\")] | .[].title" 2>/dev/null || true)"
+            n_closed="$(printf '%s' "$recent_closed_titles" | grep -c . || true)"
+            echo "Dedup-venster: $n_closed gitflow-fix-issue(s) gesloten sinds $closed_cutoff tellen mee."
+          else
+            # Zonder cutoff geen half werk: meld dat dit deel van de dedup uitvalt i.p.v. stil
+            # terug te vallen op alleen-open — dat is exact het gedrag dat hier gerepareerd wordt.
+            echo "::warning::kon de dedup-cutoff niet berekenen (date -d) — gesloten issues tellen deze sweep NIET mee in de dedup"
+          fi
+
+          # Eén plek waar "is dit al gemeld?" beantwoord wordt, zodat de failure-scan en de
+          # host-corruptie-guard hieronder niet uit elkaar kunnen lopen. Echoot de REDEN, want een
+          # sweep die iets overslaat zonder te zeggen waarom is niet te debuggen.
+          al_gemeld() {
+            printf '%s\n' "$open_titles" | grep -qiF -- "$1" && { echo "open"; return 0; }
+            printf '%s\n' "$recent_closed_titles" | grep -qiF -- "$1" && { echo "recent-gesloten"; return 0; }
+            echo ""
+          }
+
           opened=0
           seen_paths=""
           while IFS=$'\t' read -r rid rname rpath revent rcreated rurl; do
@@ -137,9 +185,15 @@ jobs:
             # Eén chore per distinct workflow-pad per sweep.
             case " $seen_paths " in *" $rpath "*) continue ;; esac
 
-            # Dedup tegen een al-open gitflow-fix-issue voor deze workflow (naam in de titel).
-            if printf '%s\n' "$open_titles" | grep -qiF -- "$rname"; then
+            # Dedup tegen een bestaand gitflow-fix-issue voor deze workflow (naam in de titel):
+            # open, of kortgeleden gesloten.
+            gemeld="$(al_gemeld "$rname")"
+            if [ "$gemeld" = "open" ]; then
               echo "Workflow '$rname' heeft al een open gitflow-fix-issue — overslaan."
+              seen_paths="$seen_paths $rpath"
+              continue
+            elif [ "$gemeld" = "recent-gesloten" ]; then
+              echo "Workflow '$rname' had < ${CLOSED_DEDUP_DAYS} dagen geleden al een gitflow-fix-issue dat gesloten is — overslaan. Keert de storing ná dat venster terug, dan opent de sweep alsnog: dát is dan vers bewijs dat de vorige fix niet hield."
               seen_paths="$seen_paths $rpath"
               continue
             fi
@@ -188,8 +242,8 @@ jobs:
             # in dezelfde sweep. Volledig draaiboek: het interne draaiboek.
             if printf '%s' "$logtail" | grep -qiE "(Access to the path '[^']*_work/[^']*' is denied|EACCES: permission denied.*_work/)"; then
               marker="runner _work-ownership-corruptie (biohack-agent)"
-              if printf '%s\n' "$open_titles" | grep -qiF -- "$marker"; then
-                echo "Host-_work-corruptie al gemeld (open needs-human-issue) — '$rname' overslaan."
+              if [ -n "$(al_gemeld "$marker")" ]; then
+                echo "Host-_work-corruptie al gemeld ($(al_gemeld "$marker")) — '$rname' overslaan."
               else
                 gh label create 'needs-human' --repo "$REPO" --color 5319E7 \
                   --description 'Vereist host-/repo-instellingen-toegang die een agent niet heeft' 2>/dev/null || true
@@ -364,10 +418,28 @@ jobs:
           # Exit-code-contract van de check-*.sh-guards: 0 = schoon, 1 = ≥1 afwijking, 2 = tool-/
           # configuratiefout (dan géén chore — dat is een infra-/permissieprobleem, geen code-bug).
 
+          # DE GUARDS ZIJN SCRIPTS VAN DE CONSUMENT, NIET VAN DE VLOOT (I28). Dit station draait in
+          # de werkmap van de aanroeper en verwacht daar `scripts/check-*.sh`. De productconsument
+          # levert die; deze repo en de lichtere consumenten niet. Zonder de controle hieronder
+          # kreeg je dan exit 127 in de `*)`-tak, met de melding "tool-/configuratiefout" — een
+          # boodschap die naar een kapotte guard wijst terwijl er simpelweg géén guard is. Van
+          # binnenuit zien die twee er identiek uit; van buitenaf niet, en daar hoort het
+          # onderscheid dus (zelfde redenering als bij `--module modules` in de doctor).
+          #
+          # Ontbreken is nadrukkelijk GEEN storing: een consument die deze guards niet heeft, wilde
+          # ze niet. Daarom een notice en geen warning — en `doctor:afhankelijkheden` (I28) is de
+          # plek die er wél iets van vindt zodra een consument een station aanroept dat ze eist.
           echo "── B1 — zombie-detectie ────────────────────────────────────────────"
-          zb_out="$(GITHUB_ACTIONS= bash scripts/check-zombie-workflows.sh 2>&1)"; zb_rc=$?
-          printf '%s\n' "$zb_out"
+          if [ ! -f scripts/check-zombie-workflows.sh ]; then
+            echo "::notice::B1 overgeslagen — deze repo levert scripts/check-zombie-workflows.sh niet (guard is consument-eigen, zie I28)."
+            zb_rc=skip
+            zb_out=""
+          else
+            zb_out="$(GITHUB_ACTIONS= bash scripts/check-zombie-workflows.sh 2>&1)"; zb_rc=$?
+            printf '%s\n' "$zb_out"
+          fi
           case "$zb_rc" in
+            skip) : ;;
             0) echo "B1 schoon — geen zombies." ;;
             1) open_guard_issue "zombie-workflow(s) gedetecteerd" \
                  "chore(ci): zombie-workflow(s) gedetecteerd door gitflow-doctor" \
@@ -378,7 +450,9 @@ jobs:
           echo "── B2 — config-drift ───────────────────────────────────────────────"
           # B2 leest secret/var-NAMEN (nooit waarden) via `gh secret/variable list` — dat vereist de
           # PAT (de GITHUB_TOKEN mag geen repo-config-namen lezen). Zonder PAT: overslaan (geen chore).
-          if [ -n "${PROJECT_TOKEN:-}" ]; then
+          if [ ! -f scripts/check-fleet-config.sh ]; then
+            echo "::notice::B2 overgeslagen — deze repo levert scripts/check-fleet-config.sh niet (guard is consument-eigen, zie I28)."
+          elif [ -n "${PROJECT_TOKEN:-}" ]; then
             fc_out="$(GITHUB_ACTIONS= GH_TOKEN="$PROJECT_TOKEN" bash scripts/check-fleet-config.sh 2>&1)"; fc_rc=$?
             printf '%s\n' "$fc_out"
             case "$fc_rc" in
