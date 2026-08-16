@@ -79,6 +79,76 @@ jobs:
             fleet
             BiohackOS
 
+      # --- BESTANDSPADEN PEILEN ---------------------------------------------------------------
+      # Welke paden in de tekst staan is tekstwerk en dus een vraag voor het beslisscript; of ze
+      # ergens BESTAAN is een API-vraag en hoort hier. Deze step verzamelt alleen feiten en beslist
+      # niets — zelfde splitsing als bij `liveness-oordeel` in fleet-doctor.sh.
+      #
+      # De paden komen uit niet-vertrouwde tekst. Twee grenzen houden dat in toom: de tekst zelf
+      # gaat via `env` (nooit als `${{ }}` in het script), en `intake-decide.sh` weigert bij de
+      # bron elk pad met een `..`-segment, zodat de peiling niet buiten `contents/` kan klimmen.
+      - name: Genoemde bestandspaden peilen
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          TITLE: ${{ inputs.issue_title }}
+          BODY: ${{ inputs.issue_body }}
+        run: |
+          set -uo pipefail
+          printf '%s' "${BODY:-}" > /tmp/body.md
+          : > /tmp/paths.tsv
+
+          paden="$(bash scripts/intake-decide.sh --print-paths --title "$TITLE" --body-file /tmp/body.md)"
+          if [ -z "$paden" ]; then
+            echo "Geen bestandspaden genoemd — de routering gaat puur op trefwoorden."
+            exit 0
+          fi
+          echo "Genoemde paden:"; printf '%s\n' "$paden" | sed 's/^/  - /'
+
+          repos="$(grep -oE '^[[:space:]]*-[[:space:]]*repo:[[:space:]]*[^[:space:]]+' routing.yml \
+                    | sed -E 's/.*repo:[[:space:]]*//')"
+
+          # NIET-BEREIKBAAR ≠ BESTAAT-NIET. Zonder deze voorcontrole zou een repo waar de app niet
+          # op geïnstalleerd staat een 404 geven op élk pad — ononderscheidbaar van "dat bestand
+          # staat daar gewoon niet", en dus stil verkeerd routeren. Eén call per repo maakt dat
+          # verschil zichtbaar.
+          onbetrouwbaar=0
+          : > /tmp/repos-ok.txt
+          while IFS= read -r repo; do
+            [ -n "$repo" ] || continue
+            if gh api "repos/$repo" --jq .full_name >/dev/null 2>&1; then
+              printf '%s\n' "$repo" >> /tmp/repos-ok.txt
+            else
+              onbetrouwbaar=1
+              echo "::warning::repo $repo is niet leesbaar met dit token — bestandspaden kunnen deze run niet eerlijk gewogen worden"
+            fi
+          done <<< "$repos"
+
+          if [ "$onbetrouwbaar" = 0 ]; then
+            while IFS= read -r pad; do
+              [ -n "$pad" ] || continue
+              while IFS= read -r repo; do
+                [ -n "$repo" ] || continue
+                if uit="$(gh api "repos/$repo/contents/$pad" --jq '.sha // "dir"' 2>&1)"; then
+                  printf '%s\t%s\n' "$repo" "$pad" >> /tmp/paths.tsv
+                  echo "  ✓ $repo bevat $pad"
+                else
+                  case "$uit" in
+                    *"Not Found"*|*"404"*) : ;;  # bestaat daar niet — dat is een geldig antwoord
+                    *) onbetrouwbaar=1
+                       echo "::warning::peiling van $pad in $repo gaf een onverwacht antwoord: $uit" ;;
+                  esac
+                fi
+              done < /tmp/repos-ok.txt
+            done <<< "$paden"
+          fi
+
+          # FAIL-SAFE: bij twijfel wegen de paden NIET mee. Dan is het gedrag byte-voor-byte het
+          # oude (trefwoorden), in plaats van een routering op halve informatie.
+          if [ "$onbetrouwbaar" = 1 ]; then
+            : > /tmp/paths.tsv
+            echo "::warning::de peiling was onvolledig — bestandspaden wegen deze run niet mee"
+          fi
+
       - name: Beslissen
         id: beslis
         env:
@@ -91,8 +161,13 @@ jobs:
           printf '%s' "${BODY:-}" > /tmp/body.md
           # Beslislogica staat los in scripts/intake-decide.sh (offline getest door
           # intake-decide.test.sh) — deze workflow blijft dom en voert alleen uit.
+          #
+          # De peiling van de vorige step gaat alleen mee als er ook echt iets in staat; een leeg
+          # bestand zou hetzelfde doen, maar zo is in de log te zien wélk pad gelopen is.
+          paden_arg=()
+          [ -s /tmp/paths.tsv ] && paden_arg=(--paths-file /tmp/paths.tsv)
           bash scripts/intake-decide.sh --title "$TITLE" --body-file /tmp/body.md \
-            --routing routing.yml > /tmp/decision.txt
+            --routing routing.yml "${paden_arg[@]}" > /tmp/decision.txt
           cat /tmp/decision.txt
           sed -n 's/^decision=/decision=/p' /tmp/decision.txt >> "$GITHUB_OUTPUT"
           sed -n 's/^target=/target=/p'     /tmp/decision.txt >> "$GITHUB_OUTPUT"

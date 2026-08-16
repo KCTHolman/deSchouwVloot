@@ -60,6 +60,19 @@ grep -q "bump-pin.yml@main" "$T/r2/.github/workflows/bump-pin.yml" \
 grep -q "pr-label.yml@cafe123" "$T/r2/.github/workflows/a.yml" \
   && ok "--keep raakt de andere bestanden wél" || bad "--keep sloeg te veel over"
 
+# --keep ALS LIJST. Nodig zodra een repo z'n eigen geneste refs pint: dan is er meer dan één
+# uitzondering (de ontpin-knop plus de canary-callers). Zonder deze test zou de lijstvorm de eerste
+# naam pakken en de rest stilzwijgend tóch herschrijven — een uitzondering die niet uitzondert.
+mkconsument "$T/r4" "main"
+bash "$PIN" rewrite --root "$T/r4" --to "beef456" --keep "bump-pin.yml, b.yml" >/dev/null 2>&1
+if grep -q "bump-pin.yml@main" "$T/r4/.github/workflows/bump-pin.yml" \
+   && grep -q "doctor.yml@main" "$T/r4/.github/workflows/b.yml" \
+   && grep -q "pr-label.yml@beef456" "$T/r4/.github/workflows/a.yml"; then
+  ok "--keep als komma-lijst spaart elk genoemd bestand (spaties toegestaan)"
+else
+  bad "--keep-lijst werkte niet: $(grep -ho '@[A-Za-z0-9]*' "$T"/r4/.github/workflows/*.yml | tr '\n' ' ')"
+fi
+
 mkdir -p "$T/r3/.github/workflows"
 printf 'name: zonder\non:\n  push: {}\njobs: {}\n' > "$T/r3/.github/workflows/x.yml"
 bash "$PIN" rewrite --root "$T/r3" --to "abc" >/dev/null 2>&1

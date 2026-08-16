@@ -49,11 +49,26 @@ Het dragende mechanisme is fase-2-bewezen: een reusable workflow draait in de **
 aanroeper** — diens runners, diens `github.repository`, diens secrets. deFleet levert logica,
 consumenten leveren hardware, secrets en domeinkennis.
 
-**De hardste ontwerpregel die daaruit volgt:** fleet-workflows hebben **uitsluitend
-`workflow_call`-triggers**. Elke `schedule`/`pull_request`/`issues`/`workflow_run`-trigger leeft
-in een **dunne caller** in de consument — een trigger in fleet zelf zou in fleet's eigen context
-draaien en geen enkele consument zien. De huidige `[fleet]`-bestanden in BiohackOS dragen hun
-triggers nog zelf; elke verhuizing is dus een **splitsing**: logica → fleet, trigger-blok → caller.
+**De hardste ontwerpregel die daaruit volgt:** fleet-**logica** — een workflow met een eigen
+`steps:`/`runs-on:` — heeft **uitsluitend `workflow_call`-triggers** (I1). Elke
+`schedule`/`pull_request`/`issues`/`workflow_run`-trigger leeft in een **dunne caller** in de
+consument; een trigger op de logica zelf zou in de context van de infra-repo draaien en geen enkele
+consument zien. Elke verhuizing is dus een **splitsing**: logica → fleet, trigger-blok → caller.
+
+Twee uitzonderingen, en die zijn het benoemen waard omdat ze eerder in drie documenten met drie
+verschillende omschrijvingen stonden:
+
+1. **`intake.yml`** — de poort hóórt in de eigen context van de infra-repo te draaien. Er is per
+   definitie geen consument die 'm als caller kan aftrappen: een idee wéét nog niet bij welk project
+   het hoort, dat is nou juist wat de poort bepaalt. De doctor kent deze uitzondering bij naam.
+2. **Pure callers** — een bestand waarvan álle jobs `uses:`-jobs zijn. Die hóren juist wél een eigen
+   trigger te dragen; een caller zonder trigger draait nooit. De doctor leidt dat af uit het bestand
+   zelf (heeft het eigen `steps:`/`runs-on:`?) en niet uit een handmatige lijst, want zo'n lijst
+   loopt achter zonder dat iets dat meldt.
+
+*In déze publieke kopie zijn beide uitzonderingen onzichtbaar: de callers zijn eruit gecureerd en
+`intake.yml` is hier `workflow_call`-only gemaakt. De invariant staat er wél volledig, want de
+regel is onderdeel van het ontwerp — zie [README §Beveiliging](../README.md).*
 
 ## 3. De pijplijn end-to-end — stations en poorten
 
@@ -106,7 +121,7 @@ dubbele waarheid; GitHub's redirect houdt de historie intact. Uitwerken (trap 2,
 daarna in het doelproject, waar de kennis woont.
 
 **Gebouwd en bewezen (M2, 2026-07-28).** De poort draait: `.github/workflows/intake.yml` (uitvoerder,
-`ubuntu-latest`), `scripts/intake-decide.sh` (de beslislogica als pure functie, 14 offline tests) en
+`ubuntu-latest`), `scripts/intake-decide.sh` (de beslislogica als pure functie, 23 offline tests) en
 `routing.yml` (trefwoordtabel). Vier paden live geverifieerd — stuiteren op te vaag (`needs-detail`),
 niet-gokken bij ambiguïteit (`needs-routing`), native transfer naar de consument, en zelf-routering
 van fleet-infrawerk. Latency 14–21 s. Twee ontwerpkeuzes wijken bewust af van de tekst hieronder:
@@ -235,8 +250,20 @@ labels:                     # de takentaxonomie van deze consument
 leest deze bestanden; fleet levert de skeletten ("je bent de triage-agent, doe X"), de consument
 levert het domein ("in dit project geldt constitution.md > spec.md, raak nooit pad Y aan").
 
-**Dunne callers** — één per station, ~15 regels: triggers + `uses: KCTHolman/fleet/...@main` +
-`secrets: inherit`. Dit is het enige workflow-bestand dat in de consument leeft.
+**Dunne callers** — één per station: triggers + `uses: KCTHolman/fleet/...@<sha>` +
+`secrets: inherit`. Een caller is 20 tot ~100 regels, afhankelijk van hoeveel inputs het station
+kent; het model is "trigger-blok plus doorgeefluik", niet "vaste vijftien regels".
+
+Twee verduidelijkingen, omdat de schets hierboven compacter is dan de praktijk:
+
+- **Een caller staat naast, niet in plaats van, het domein.** De consument houdt bewust z'n eigen
+  domein-workflows (deploys, release-builds, domein-crons) — die dragen productkennis en horen daar
+  thuis. De migratie verplaatst alleen de *machinerie*; wat er per repo overblijft is precies wat
+  per repo hoort te verschillen.
+- **De ref is een SHA, geen `@main`.** Zie [gitflow §13.D](gitflow.md) en I24: alleen de canary
+  volgt `@main`. Codevoorbeelden in deze repo tonen `@main` omdat dat leesbaarder is; in een echte
+  consument staat daar een volle 40-teken-SHA, bijgewerkt door de bump-baan en bewaakt door
+  `doctor:pin`.
 
 **Blijft volledig per repo:** constitution, AGENTS.md, spec, domein-workflows (`[biohack]`-bucket:
 deploys, domein-crons, release-builds) en de guard-scripts die domeinkennis dragen
@@ -285,16 +312,27 @@ Ontwerpkeuzes:
 
 ## 6. Invarianten en zelf-diagnose — de "fleet-doctor"
 
-De losse guards van vandaag worden één samenhangende, fleet-geleverde suite:
+De losse guards zijn opgegaan in één samenhangende, fleet-geleverde suite. Dit zijn de modules die
+`scripts/fleet-doctor.sh` daadwerkelijk kent — opvraagbaar met `--module modules`, en dat is geen
+gemak maar noodzaak: een consument die op een oudere SHA staat, moet het verschil kunnen zien
+tussen een typefout en een module die z'n gepinde doctor nog niet heeft.
 
-| Invariant (bestaat al als) | Wordt | Draait |
-|---|---|---|
-| `runner-fleet-assert.yml` — lanes online, labels kloppen | `fleet-doctor` module *runners* | schedule (caller) + na elke registratiewijziging |
-| `check-fleet-config.sh` — claude-jobs op agent-lane, geen lane-verspilling | module *routing* (leest `.fleet.yml`) | pr-check van elke consument |
-| `branch-protection-assert.yml` — ruleset-drift | module *governance* | schedule |
-| `runner-maintenance.sh check` — §7b-onderhoud aanwezig | module *host* (read-only) | `self-hosted host-diagnostics` op dispatch + wekelijks |
-| `gitflow-doctor` — zombie-runs, stalls | module *flow* | schedule |
-| lessen uit vanavond (nieuw) | module *consistentie*: workflow_run-triggerlijsten matchen bestaande namen; callers wijzen naar bestaande fleet-paden; geen `container:` op agent-lane-jobs | pr-check |
+| Module | Wat 'ie vaststelt | Invarianten | Netwerk nodig |
+|---|---|---|---|
+| *consistentie* | eigen triggers op fleet-logica; callers wijzen naar bestaande paden; geen `container:` op agent-lane-jobs; `workflow_run`-naamlijsten matchen echte namen | I1, I2, I5, I7 | nee |
+| *permissies* | een caller verleent minstens wat z'n station nodig heeft (union van workflow- én job-permissies) | I26 | nee |
+| *spine* | geen spine-workflow staat `disabled_manually`/`disabled_inactivity` | I25 | ja |
+| *runners* | lanes online, labels kloppen, override-modus is nooit stilzwijgend | I10, I11 | ja |
+| *contract* | `.fleet.yml` valideert tegen het schema | — | nee |
+| *liveness* | reageert elke `workflow_run`-luisteraar op z'n bron? | I27 | ja |
+| *afhankelijkheden* | eist een aangeroepen station een script dat de consument niet heeft? | I28 | nee |
+| *pin* | pin-achterstand, verdeelde pins, geneste refs op een branch | I24 | ja (zacht) |
+
+De modules zónder netwerk zijn offline testbaar en staan onder test in `fleet-doctor.test.sh`; van
+`liveness` en `pin` is de beslislogica losgetrokken in een pure functie (`liveness_oordeel`,
+`pin_oordeel`) die via een verborgen `--module …-oordeel` óók offline getoetst wordt. De
+API-afhankelijke bedrading eromheen draait tegen een nagemaakte `gh` die de meegegeven `--jq` met de
+échte jq toepast, zodat de jq-expressie zelf onder test staat en niet alleen de bedrading.
 
 Belangrijk onderscheid: de doctor **rapporteert hard, muteert nooit**. Mutaties (reregistratie,
 prunes) blijven bij de watchdog (repo-scope) of owner-assist (host-scope, zie

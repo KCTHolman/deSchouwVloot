@@ -183,27 +183,49 @@ verwacht_oordeel "bron heeft nooit gedraaid => geen oordeel" 0 0 1800 geen-bron
 # zodat de test offline blijft.
 echo "fleet-doctor · I27 (bedrading, met nagemaakte gh):"
 
+# De nagemaakte `gh` past de meegegeven `--jq` met de ECHTE jq toe (zie hieronder). `gh` heeft z'n
+# eigen jq ingebouwd, dus de doctor zélf heeft de binary niet nodig — deze test wel. Ontbreekt-ie,
+# dan overslaan i.p.v. falen: zelfde regel als bij de andere gereedschap-guards, ontbrekend
+# gereedschap is geen bevinding. Op ubuntu-latest (waar CI draait) staat jq voorgeïnstalleerd.
+if ! command -v jq >/dev/null 2>&1; then
+  printf '  \xe2\x9a\xa0\xef\xb8\x8f  overgeslagen: jq ontbreekt (alleen de bedradingstests, niet de rekenregel hierboven)\n'
+else
+
 mkrepo "$T/i27" 0
 printf 'name: "[shared] PR check"\non:\n  pull_request: {}\njobs: {}\n' > "$T/i27/.github/workflows/pr-check.yml"
 printf "name: \"[fleet] Auto-merge\"\non:\n  workflow_run:\n    workflows: ['\\\\[shared\\\\] PR check']\njobs: {}\n" > "$T/i27/.github/workflows/auto-merge.yml"
 
 mkdir -p "$T/i27bin"
+# De nagemaakte `gh` geeft een fixture-JSON terug en past de meegegeven `--jq` er ECHT op toe (met
+# de echte jq). Zo staat de jq-expressie uit het script zélf onder test — niet alleen de bedrading
+# eromheen. Dat is precies wat nodig is voor de actor-filter hieronder: die zit in de jq.
 cat > "$T/i27bin/gh" <<'STUB'
 #!/usr/bin/env bash
-# Bron liep op een vast moment; de laatste run van de luisteraar komt uit $LUISTERAAR.
-for a in "$@"; do
-  case "$a" in
-    *"workflows/pr-check.yml/runs"*)   echo "2026-07-28T07:21:00Z"; exit 0 ;;
-    *"workflows/auto-merge.yml/runs"*) echo "$LUISTERAAR"; exit 0 ;;
+q=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --jq) q="$2"; shift 2 ;;
+    api)  shift ;;
+    *)    url="$1"; shift ;;
   esac
 done
+case "$url" in
+  *"workflows/pr-check.yml/runs"*)   printf '%s' "$BRON_JSON"       | jq -r "$q" ;;
+  *"workflows/auto-merge.yml/runs"*) printf '%s' "$LUISTERAAR_JSON" | jq -r "$q" ;;
+esac
 exit 0
 STUB
 chmod +x "$T/i27bin/gh"
 
-# i27run <laatste-run-van-de-luisteraar> → zet $out en $rc
+# Standaard-bron: één voltooide run, door een mens aangezwengeld — die kán dus een event afgeven.
+BRON_STD='{"workflow_runs":[{"created_at":"2026-07-28T07:21:00Z","actor":{"login":"KCTHolman"}}]}'
+
+# i27run <laatste-workflow_run-run-van-de-luisteraar> [bron-json] → zet $out en $rc
 i27run() {
-  out="$(PATH="$T/i27bin:$PATH" LUISTERAAR="$1" bash "$DOCTOR" --module liveness --repo x/y --root "$T/i27" 2>&1)"
+  local ljson='{"workflow_runs":[]}'
+  [ -n "$1" ] && ljson="$(printf '{"workflow_runs":[{"created_at":"%s"}]}' "$1")"
+  out="$(PATH="$T/i27bin:$PATH" BRON_JSON="${2:-$BRON_STD}" LUISTERAAR_JSON="$ljson" \
+         bash "$DOCTOR" --module liveness --repo x/y --root "$T/i27" 2>&1)"
   rc=$?
 }
 
@@ -230,6 +252,47 @@ if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "nog NOOIT" && printf '%s' "$ou
 else
   bad "verse luisteraar verkeerd gerapporteerd (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
 fi
+
+# EEN GESMOORDE BRON-RUN IS GEEN BRON. GitHub's recursie-slot laat een run die met de GITHUB_TOKEN
+# is aangezwengeld (actor `github-actions[bot]`) géén vervolg-events afgeven; de luisteraar kán daar
+# dus niet op reageren. Nieuwste run is zo'n gesmoorde dispatch, daarvóór een echte waar de
+# luisteraar wél op reageerde => levend, geen vals alarm. Dit is de storing die I27 bij een
+# consument permanent hard rood zette (2026-08-01) en zo de merge-poort dichthield.
+i27run "2026-07-28T07:23:00Z" '{"workflow_runs":[
+  {"created_at":"2026-07-29T09:00:00Z","actor":{"login":"github-actions[bot]"}},
+  {"created_at":"2026-07-28T07:21:00Z","actor":{"login":"claude[bot]"}}]}'
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "alle 1"; then
+  ok "GITHUB_TOKEN-dispatch telt niet als bron => geen vals alarm"
+else
+  bad "vals alarm op een bron-run die geen event kón afgeven (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# De keerzijde: de filter mag een ECHTE dode trigger niet wegpoetsen. Nieuwste bruikbare bron-run
+# is door een mens gestart en de luisteraar zweeg => nog steeds hard rood.
+i27run "2026-07-18T14:10:00Z" '{"workflow_runs":[
+  {"created_at":"2026-07-29T09:00:00Z","actor":{"login":"github-actions[bot]"}},
+  {"created_at":"2026-07-28T07:21:00Z","actor":{"login":"KCTHolman"}}]}'
+if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "NIET gereageerd"; then
+  ok "filter poetst een echte dode trigger niet weg"
+else
+  bad "dode trigger gemist door de actor-filter (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# EEN BRON-RUN DIE NÉT IS AFGEROND TELT NOG NIET. De reactie kan dan nog in de maak zijn, en die
+# stilte als dode trigger lezen is vals alarm — gemeten 2026-08-01: twee seconden tussen het
+# afronden van de bron en het ontstaan van de reactie erop. Nieuwste run rondde zojuist af (valt
+# af), de oudere bron eronder telt en dáár reageerde de luisteraar op.
+vers="$(date -u -d '-10 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
+i27run "2026-07-28T07:23:00Z" "$(printf '{"workflow_runs":[
+  {"created_at":"%s","updated_at":"%s","actor":{"login":"KCTHolman"}},
+  {"created_at":"2026-07-28T07:21:00Z","updated_at":"2026-07-28T07:21:30Z","actor":{"login":"KCTHolman"}}]}' "$vers" "$vers")"
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "alle 1"; then
+  ok "net afgeronde bron-run telt nog niet => geen vals alarm op de race"
+else
+  bad "vals alarm op een bron-run die net klaar was (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+fi # einde jq-guard (I27-bedrading)
 
 echo "fleet-doctor · I28 (consument-side afhankelijkheden van een station):"
 
@@ -291,6 +354,82 @@ if printf '%s' "$out" | grep -q "roept geen stations"; then
   ok "naam matcht niet => zegt eerlijk dat er niets te toetsen viel"
 else
   bad "onduidelijk gemeld bij een niet-matchende repo-naam"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# --- I1-REGRESSIE: grote bestanden werden stil overgeslagen -----------------------------------
+# `grep -q` sluit de pijp bij de eerste treffer; `sed` krijgt SIGPIPE en onder `set -o pipefail`
+# leest de pijplijn dan als "geen match". Bij kleine bestanden is sed al klaar vóór grep afsluit,
+# dus de fout was onzichtbaar — juist de GROOTSTE workflows (auto-merge: 547 regels) glipten
+# erdoor. Een I1 die precies de zwaarste stations niet toetst, is een groen vinkje dat niets dekt.
+# Vandaar een testbestand met veel regels ná de `runs-on:`-treffer.
+mkrepo "$T/i1groot" 1
+{
+  printf 'name: "[fleet] groot"\non:\n  schedule:\n    - cron: "0 6 * * *"\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo hoi\n'
+  for i in $(seq 1 800); do printf '      # vulregel %s\n' "$i"; done
+} > "$T/i1groot/.github/workflows/groot.yml"
+verwacht_fout "I1 ziet ook een GROOT bestand met eigen trigger (SIGPIPE-regressie)" "$T/i1groot" "I1:"
+
+echo "fleet-doctor · pin-oordeel (I24, offline beslisser):"
+
+# po <naam> <verwacht> <gepind> <hoofd> <drempel> <n_refs>
+po() {
+  local naam="$1" want="$2"; shift 2
+  local got; got="$(bash "$DOCTOR" --module pin-oordeel --repo "$*" 2>/dev/null | head -1)"
+  if [ "$got" = "$want" ]; then ok "$naam"; else bad "$naam (verwacht '$want', kreeg '$got')"; fi
+}
+
+# 1700000000 = referentiemoment; +6 dagen blijft binnen de drempel van 7, +30 niet.
+po "verse pin => actueel"                 actueel   1700000000 1700518400 7 1
+po "pin van 30 dagen oud => verouderd"    verouderd 1700000000 1702592000 7 1
+po "precies op de drempel => actueel"     actueel   1700000000 1700604800 7 1
+po "twee verschillende pins => verdeeld"  verdeeld  1700000000 1700100000 7 2
+po "verdeeld wint van vers"               verdeeld  1700518400 1700518400 7 3
+po "geen pin => ongepind"                 ongepind  0 1700000000 7 0
+po "datum onbekend => onbekend"           onbekend  0 1700000000 7 1
+po "eigen drempel (60 dagen)"             actueel   1700000000 1702592000 60 1
+
+echo "fleet-doctor · pin-module op bestandsniveau:"
+
+# De kanarie (de Vloot zelf) hóórt @main te volgen — daar iets van vinden zou I24 omdraaien.
+mkrepo "$T/pinfleet" 1
+printf 'name: c\non:\n  push: {}\njobs:\n  c:\n    uses: KCTHolman/fleet/.github/workflows/checks.yml@main\n' > "$T/pinfleet/.github/workflows/c.yml"
+out="$(bash "$DOCTOR" --module pin --root "$T/pinfleet" 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "kanarie" && printf '%s' "$out" | grep -qF '`@main`'; then
+  ok "de kanarie zelf krijgt geen pin-bevinding"
+else
+  bad "kanarie (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# Twee verschillende SHA's in één consument = half gelukte bump. Dat is een bestandsfeit, dus
+# offline toetsbaar — geen API nodig om te zien dat het er twee zijn.
+mkrepo "$T/pinsplit" 0
+printf 'jobs:\n  a:\n    uses: KCTHolman/fleet/.github/workflows/x.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$T/pinsplit/.github/workflows/a.yml"
+printf 'jobs:\n  b:\n    uses: KCTHolman/fleet/.github/workflows/y.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' > "$T/pinsplit/.github/workflows/b.yml"
+out="$(bash "$DOCTOR" --module pin --root "$T/pinsplit" 2>&1)"; rc=$?
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q "VERSCHILLENDE pins"; then
+  ok "twee verschillende pins in één consument => rood"
+else
+  bad "verdeelde pins (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# Zelfde ont-hardcodeer-test als bij I28 hierboven: onder een ANDERE --fleet-repo mag dezelfde repo
+# niets vinden. Zonder deze test is een hardgecodeerde naam onzichtbaar, want die meldt dan gewoon
+# ✅ — precies de faalvorm die deze module aan de kaak stelt.
+out="$(bash "$DOCTOR" --module pin --root "$T/pinsplit" --fleet-repo "Iemand/anders" 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "niets te pinnen"; then
+  ok "--fleet-repo stuurt ook hier de match"
+else
+  bad "pin-module negeert --fleet-repo (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
+fi
+
+# Een consument die geen enkel station aanroept heeft niets te pinnen.
+mkrepo "$T/pinleeg" 0
+printf 'jobs:\n  a:\n    runs-on: ubuntu-latest\n' > "$T/pinleeg/.github/workflows/a.yml"
+out="$(bash "$DOCTOR" --module pin --root "$T/pinleeg" 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "niets te pinnen"; then
+  ok "geen aanroepen => niets te melden"
+else
+  bad "lege consument (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
 echo "fleet-doctor · echte repo's:"

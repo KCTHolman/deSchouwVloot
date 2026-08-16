@@ -8,6 +8,19 @@
 # voorkomt telt één punt voor z'n consument. De consument met strikt de meeste punten wint. Bij
 # gelijkspel of nul punten → `needs-routing`.
 #
+# EEN GENOEMD BESTANDSPAD WEEGT VIJF PUNTEN. Een trefwoord zegt iets over het ONDERWERP, een pad
+# over de PLAATS: wie `.github/workflows/pr-check.yml` noemt, verraadt al in welke repo 'ie zit.
+# De poort peilt elk genoemd pad bij elke consument en telt alleen wat er écht bestaat — per
+# DISTINCT pad, zodat een pad dat overal bestaat iedereen even hard verhoogt en dus niets beslist.
+# Lukt die peiling niet volledig, dan wegen paden niet mee en is het gedrag exact het oude.
+# Zwaarder dan een trefwoord, maar niet absoluut: overweldigend trefwoordbewijs wint nog steeds,
+# en een gelijkspel blijft `needs-routing`.
+#
+# Houd trefwoorden ONDERSCHEIDEND. Woorden die op meerdere consumenten passen horen hier niet: die
+# maken de routering juist botter. Let daarbij op de eigen infra-woorden — zodra een consument een
+# term als `fleet` in z'n eigen code gebruikt, is dat trefwoord niet langer eenduidig en hoort er
+# een grensgeval in de golden-set dat precies die botsing bevriest.
+#
 # Onderhoud: voeg een trefwoord toe zodra je een issue ziet dat verkeerd (of niet) routeerde.
 # Dit bestand is de enige plek waar projectkennis in de poort zit — houd 'm daarom kort en
 # onderscheidend: woorden die bij MEERDERE consumenten passen horen hier niet (die maken de
