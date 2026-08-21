@@ -4,6 +4,11 @@ Gedeelde gitflow- en runner-infrastructuur voor meerdere projecten: herbruikbare
 routerende intake-poort, en een set machinaal toetsbare invarianten die de pijplijn zichzelf laten
 bewaken. Geen productcode, geen domeinlogica, geen data — alleen de machinerie zelf.
 
+Elk aangesloten project blijft zelfstandig: eigen repo, eigen issues, eigen architectuur, eigen
+workflow. Wat gedeeld wordt is de vórm eromheen — dezelfde stations, dezelfde poorten, dezelfde
+invarianten. Een issue ontstaat dus in de repo waar het thuishoort; de intake-poort hieronder is de
+zijingang voor het losse idee dat nog geen plek heeft, niet de voordeur van al het werk.
+
 Hierna kortweg **de Vloot**.
 
 Dit is een **gecureerde, publieke kopie** van een privé-productierepo. Wat hier staat draait
