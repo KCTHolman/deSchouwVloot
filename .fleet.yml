@@ -22,9 +22,39 @@ lanes:
 gates:
   # Geen mens-poort op features: deze repo bevat alleen machinerie, geen product. Verandert dat,
   # dan gaat deze op `true` en wacht een feature-PR hier ook op approval.
+  #
+  # LET OP — deze sleutel BESCHRIJFT sinds 2026-08-23 alleen nog. Tot die datum las géén enkele
+  # workflow 'm: het contract beloofde een poort die nergens werd afgedwongen, want het gedrag zat
+  # hardgecodeerd in auto-merge.yml. De stand die de machinerie echt uitvoert staat hieronder in
+  # `autonomy`. Beide sleutels bestaan naast elkaar zolang de consumenten migreren; `autonomy` is
+  # de sturende.
   feature_approval: false
-  # Geen productie-omgeving: deFleet levert niets uit.
+  # Geen productie-omgeving: de Vloot levert niets uit.
   release_environment: null
+
+# DE AUTONOMIESTAND — beslist de machine zelf, of hoort er een mens aan te pas? (docs/architectuur.md §4b)
+#
+# `mode` is de repo-default, `stations` overschrijft 'm per beslispunt, en de repo-variabele
+# `FLEET_AUTONOMY` overschrijft allebei zonder dat er iets gecommit hoeft te worden — een
+# schakelaar die een merge nodig heeft is geen schakelaar. De resolver
+# (scripts/autonomie-beslis.sh) legt de volgorde vast en is per poort getest.
+#
+# WAAROM DEZE REPO OP AUTONOOM STAAT. Er zit geen product in: de "gebruiker" van een fout is een
+# workflow-run, niet een mens met een app. Een verkeerde merge valt binnen één run op (checks.yml
+# draait elke testsuite) en gaat met één revert weg. De verhouding tussen "hoe snel merk je een
+# fout" en "hoe duur is 'ie" is hier gunstiger dan in welke consument dan ook.
+#
+# WAT ER NIET MEE OMGAAT — de vloer staat in élke stand:
+#   • de gevoelige-paden-guard forceert altijd een echte approval;
+#   • `needs-human` / `no-automerge` stoppen altijd;
+#   • `FLEET_HALT=1` zet deze repo in één commando terug naar mens-in-de-lus;
+#   • breaking changes wachten op een mens, want `allow_breaking` staat hieronder op false.
+autonomy:
+  mode: autonomous
+  # Bewust false, ook in autonome stand. Een `feat!:` of `fix!:` hier is per definitie een
+  # wijziging die elke consument tegelijk raakt — precies het geval waarin "één revert lost het op"
+  # niet meer waar is, omdat de pin bij elke consument apart terug moet.
+  allow_breaking: false
 
 budgets:
   default_model: claude-sonnet-5

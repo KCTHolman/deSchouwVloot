@@ -40,6 +40,19 @@ Menselijke aandacht is de schaarste. In het hele systeem zitten precies drie ple
 verschijnt: feature-approval, release-approval, en escalatie bij `needs-human`. Al het andere is
 doorstroom. Zie [docs/architectuur.md §3](docs/architectuur.md).
 
+Sinds 2026-08-23 is dat geen **eigenschap** meer maar een **keuze**. Waar een mens verscheen lag
+daarvoor verspreid over een stuk of tien `if`-takken in de merge-machine, een handvol labels, en
+een contractsleutel die *geen enkele workflow las* — je kon niet opzoeken in welke stand een repo
+stond, en niet omzetten zonder de machinerie te bewerken. Nu is het één schakelaar met één resolver
+eronder ([`scripts/autonomie-beslis.sh`](scripts/autonomie-beslis.sh), per poort getest), en één
+repo-variabele die 'm omzet zónder commit — een schakelaar die een merge nodig heeft, is geen
+schakelaar.
+
+Het interessante zit niet in de stand maar in de **vloer**: vier poorten liggen vóór de schakelaar
+en sluiten ongeacht wat er ingesteld staat — de gevoelige-paden-guard, de noodrem `FLEET_HALT`, de
+stoplabels, en breaking changes. In beide standen kan een mens overal ingrijpen; alleen de richting
+van de default draait om. Zie [docs/architectuur.md §4b](docs/architectuur.md).
+
 ### 2. Configuratie die gedrag stuurt, is code — dus krijgt het tests
 
 De intake-poort routeert issues naar het juiste project op basis van een trefwoordtabel. Eén te
@@ -70,9 +83,11 @@ instantie:
 | **I27** | trigger, pad, naam en permissies allemaal correct, en tóch tien uur lang geen enkele run | meet het **gedrag**: liep de bron, en reageerde de luisteraar erop? |
 | **I28** | een station mist een script bij de consument, draait fail-closed en merget per constructie nooit meer | de eis wordt **uit de stationsdefinitie zelf** afgeleid, niet uit een handlijst die achterloopt |
 | **I24** | een pin die niet opschuift leest als groen, want een doctor-module die de gepinde versie nog niet kent wordt netjes overgeslagen | `doctor:pin` maakt achterstand en verdeelde pins een **harde** bevinding |
+| **I29** | een guard geeft het júíste oordeel, maar in een vorm die het station niet leest — elke PR wacht dan op een mens terwijl de merge-machine er gezond uitziet | toetst het **protocol** (`^CLEAN:` / `^FORCE-APPROVAL:`), niet alleen dát er een guard is |
+| **I30** | het contract belooft een label dat in de repo niet bestaat; bij een issue-transfer verdwijnt het stil, want alleen bestaande namen overleven de verhuizing | de labels uit `.fleet.yml` moeten in de repo **echt bestaan** |
 
-Vier keer dezelfde vorm, en dat het patroon één keer benoemd is, is precies waarom de vierde
-gericht gevonden werd in plaats van toevallig. De verdediging is telkens hetzelfde principe: meet
+Zes keer dezelfde vorm, en dat het patroon één keer benoemd is, is precies waarom de latere
+gericht gevonden werden in plaats van toevallig. De verdediging is telkens hetzelfde principe: meet
 het gedrag, niet de configuratie — en toets elke nieuwe guard één keer tégen de storing die 'm rood
 hoort te maken, want een check die nooit rood is geweest is niet aantoonbaar een check. Zie
 [docs/gitflow.md §11](docs/gitflow.md).

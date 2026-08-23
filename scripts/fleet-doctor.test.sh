@@ -256,8 +256,8 @@ fi
 # EEN GESMOORDE BRON-RUN IS GEEN BRON. GitHub's recursie-slot laat een run die met de GITHUB_TOKEN
 # is aangezwengeld (actor `github-actions[bot]`) géén vervolg-events afgeven; de luisteraar kán daar
 # dus niet op reageren. Nieuwste run is zo'n gesmoorde dispatch, daarvóór een echte waar de
-# luisteraar wél op reageerde => levend, geen vals alarm. Dit is de storing die I27 bij een
-# consument permanent hard rood zette (2026-08-01) en zo de merge-poort dichthield.
+# luisteraar wél op reageerde => levend, geen vals alarm. Dit is de storing die I27 permanent hard
+# rood zette in BiohackOS (2026-08-01) en zo de merge-poort dichthield.
 i27run "2026-07-28T07:23:00Z" '{"workflow_runs":[
   {"created_at":"2026-07-29T09:00:00Z","actor":{"login":"github-actions[bot]"}},
   {"created_at":"2026-07-28T07:21:00Z","actor":{"login":"claude[bot]"}}]}'
@@ -280,8 +280,8 @@ fi
 
 # EEN BRON-RUN DIE NÉT IS AFGEROND TELT NOG NIET. De reactie kan dan nog in de maak zijn, en die
 # stilte als dode trigger lezen is vals alarm — gemeten 2026-08-01: twee seconden tussen het
-# afronden van de bron en het ontstaan van de reactie erop. Nieuwste run rondde zojuist af (valt
-# af), de oudere bron eronder telt en dáár reageerde de luisteraar op.
+# afronden van feature-governance en het ontstaan van de auto-merge-run erop. Nieuwste run rondde
+# zojuist af (valt af), de oudere bron eronder telt en dáár reageerde de luisteraar op.
 vers="$(date -u -d '-10 seconds' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)"
 i27run "2026-07-28T07:23:00Z" "$(printf '{"workflow_runs":[
   {"created_at":"%s","updated_at":"%s","actor":{"login":"KCTHolman"}},
@@ -296,12 +296,12 @@ fi # einde jq-guard (I27-bedrading)
 
 echo "fleet-doctor · I28 (consument-side afhankelijkheden van een station):"
 
-# Een station draait in de werkmap van de CONSUMENT. Roept het daar `scripts/foo.sh` aan, dan is
-# dat een harde eis aan die consument die nergens als eis opgeschreven staat. Met één consument
-# valt dat nooit op. Gemeten 2026-07-28: `auto-merge` eist `scripts/sensitive-paths-guard.sh`, en
-# een tweede consument heeft dat niet — het station zou daar netjes fail-closed draaien en dus
-# NOOIT mergen, zonder dat er iets rood wordt. Een station dat per constructie altijd hetzelfde
-# antwoord geeft, ziet er van buiten uit als een werkende check.
+# Een fleet-station draait in de werkmap van de CONSUMENT. Roept het daar `scripts/foo.sh` aan,
+# dan is dat een harde eis aan die consument die nergens als eis opgeschreven staat. Met één
+# consument valt dat nooit op. Gevonden 2026-07-28: `auto-merge` eist
+# `scripts/sensitive-paths-guard.sh`, en InvestingOS heeft dat niet — het station zou daar netjes
+# fail-closed draaien en dus NOOIT mergen, zonder dat er iets rood wordt. Een station dat per
+# constructie altijd hetzelfde antwoord geeft, ziet er van buiten uit als een werkende check.
 mkrepo "$T/i28fleet" 1
 printf 'name: "[fleet] station"\non:\n  workflow_call: {}\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/nodig.sh --diff d\n' > "$T/i28fleet/.github/workflows/station.yml"
 
@@ -319,47 +319,134 @@ mkdir -p "$T/i28mis/scripts"; : > "$T/i28mis/scripts/nodig.sh"
 out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28mis" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
 if [ "$rc" = 0 ]; then ok "script aanwezig => schoon"; else bad "vals-positief (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'; fi
 
-# De checkout van het station zelf (`.fleet-doctor/scripts/...`) is GEEN eis aan de consument.
-# Zonder die uitzondering zou elke doctor-caller vals alarm geven.
+# De fleet-checkout van het station zelf (`.fleet-doctor/scripts/...`) is GEEN eis aan de
+# consument. Zonder die uitzondering zou elke doctor-caller vals alarm geven.
 mkrepo "$T/i28eigen" 1
 printf 'name: "[fleet] d"\non:\n  workflow_call: {}\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash .fleet-doctor/scripts/fleet-doctor.sh --module consistentie\n' > "$T/i28eigen/.github/workflows/d.yml"
 mkrepo "$T/i28c2" 0
 printf 'name: caller\non:\n  schedule:\n    - cron: "0 6 * * *"\njobs:\n  c:\n    uses: KCTHolman/fleet/.github/workflows/d.yml@main\n' > "$T/i28c2/.github/workflows/c.yml"
 bash "$DOCTOR" --module afhankelijkheden --root "$T/i28c2" --fleet-root "$T/i28eigen" >/dev/null 2>&1
-if [ $? = 0 ]; then ok "eigen checkout telt niet als consument-eis"; else bad "vals-positief op .fleet-doctor/-pad"; fi
+if [ $? = 0 ]; then ok "fleet's eigen checkout telt niet als consument-eis"; else bad "vals-positief op .fleet-doctor/-pad"; fi
 
-# Zonder checkout kun je de eis niet lezen: waarschuwen, niet hard falen — anders wordt een
+# Zonder fleet-checkout kun je de eis niet lezen: waarschuwen, niet hard falen — anders wordt een
 # ontbrekend gereedschap als een bevinding gelezen (zelfde regel als bij de jq-guard).
 bash "$DOCTOR" --module afhankelijkheden --root "$T/i28mis" >/dev/null 2>&1
 if [ $? = 0 ]; then ok "geen --fleet-root => waarschuwing, geen harde fout"; else bad "ontbrekende fleet-root zou zacht moeten zijn"; fi
 
-# DE BELANGRIJKSTE VAN DIT BLOK. De repo-naam in de `uses:`-verwijzing is een PARAMETER, geen
-# constante — deze logica wordt onder meer dan één naam aangeroepen. Staat die naam hardgecodeerd,
-# dan matcht de grep niets, meldt de module vrolijk ✅ en bewaakt 'ie niets. Dat is exact de
-# faalvorm die I28 zélf aan de kaak stelt, en precies daarom mag 'ie hier niet op vertrouwen
-# rusten maar hoort er een test omheen.
-mkrepo "$T/i28alias" 0
-printf 'name: caller\non:\n  pull_request: {}\njobs:\n  c:\n    uses: KCTHolman/deSchouwVloot/.github/workflows/station.yml@main\n' > "$T/i28alias/.github/workflows/c.yml"
-out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28alias" --fleet-root "$T/i28fleet" --fleet-repo KCTHolman/deSchouwVloot 2>&1)"; rc=$?
-if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "I28"; then
-  ok "--fleet-repo stuurt de match => ook onder een andere repo-naam bewaakt 'ie echt"
+echo "fleet-doctor · I30 (bestaan de contractlabels echt?):"
+
+# `.fleet.yml` heeft een VERPLICHTE `labels:`-sectie die tot 2026-08-23 door geen enkel station
+# werd gelezen: gevalideerd, afgedwongen, decoratief. De sectie draagt wel een echte belofte —
+# labels reizen niet mee bij een issue-transfer, dus de doelrepo moet ze zelf hebben. Die garantie
+# hing aan `ensure-labels.sh`, dat in één van de vijf consumenten bestaat met nul aanroepers.
+#
+# Zonder `--repo` is er niets te zien: dan waarschuwen, niet falen (zelfde regel als I28 zonder
+# --fleet-root). Alleen die tak is offline testbaar; de API-tak draait in CI op de echte repo's.
+mkrepo "$T/i30" 0
+printf 'version: 1\nlanes:\n  agent: ubuntu-latest\n  heavy: ubuntu-latest\n  light: ubuntu-latest\n  fallback: ubuntu-latest\ngates:\n  feature_approval: false\nbudgets:\n  default_model: claude-sonnet-5\n  max_turns:\n    triage: 20\nlabels:\n  task: fleet-task\n  human: needs-human\n' > "$T/i30/.fleet.yml"
+out="$(bash "$DOCTOR" --module contract --root "$T/i30" 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "I30.*geen --repo"; then
+  ok "geen --repo => waarschuwing, geen harde fout"
 else
-  bad "alias-naam niet herkend (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+  bad "I30 zonder --repo zou zacht moeten zijn (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
 fi
 
-# Andersom: staat de vlag NIET op de naam die in de caller staat, dan mag de module niet doen
-# alsof 'ie iets controleerde. "Geen stations gevonden" is een ander antwoord dan "alles klopt".
-out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i28alias" --fleet-root "$T/i28fleet" 2>&1)"
-if printf '%s' "$out" | grep -q "roept geen stations"; then
-  ok "naam matcht niet => zegt eerlijk dat er niets te toetsen viel"
+# Een contract zonder labels-sectie is (nog) geldig voor de validator noch voor I30 een onderwerp:
+# de contractcheck klaagt daar zelf al over, en I30 hoort daar niet overheen te roepen.
+mkrepo "$T/i30geen" 0
+printf 'version: 1\n' > "$T/i30geen/.fleet.yml"
+out="$(bash "$DOCTOR" --module contract --root "$T/i30geen" --repo KCTHolman/bestaat-niet 2>&1)"
+if ! printf '%s' "$out" | grep -q "I30"; then
+  ok "geen labels-sectie => I30 zwijgt (dat is de contractcheck z'n vraag)"
 else
-  bad "onduidelijk gemeld bij een niet-matchende repo-naam"; printf '%s\n' "$out" | sed 's/^/      /'
+  bad "I30 klaagt over een contract zonder labels-sectie"; printf '%s\n' "$out" | sed 's/^/      /'
 fi
+
+echo "fleet-doctor · I29 (spreekt de guard de taal die het station leest?):"
+
+# I28 toetst of het bestand BESTAAT. Dat bleek niet genoeg. InvestingOS' guard bestond, was 282
+# regels, had een eigen self-test — en zou tóch nooit een CLEAN opleveren, want hij kende `--diff`
+# niet en printte de KALE woorden terwijl auto-merge op `^CLEAN:` grept. Fail-closed dus veilig,
+# maar stil en permanent: elke PR wacht op een mens terwijl de machine er werkend uitziet.
+#
+# Deze tests toetsen de VORM van het oordeel, nooit welk oordeel. Wélke paden gevoelig zijn is
+# domeinkennis van de consument; dát er een leesbaar oordeel uit komt, is dat niet.
+
+# guardrepo <map> <regel-die-het-script-print> [--kent-diff]
+guardrepo() {
+  local d="$1" regel="$2" kent="${3:-}"
+  mkrepo "$d" 0
+  # I29 hangt onder I28, en die stapt eruit als de repo geen enkel fleet-station aanroept. Een
+  # consument zónder callers heeft ook geen station dat z'n guard leest, dus die vraag is daar
+  # terecht niet aan de orde. De fixture heeft dus een caller nodig om realistisch te zijn.
+  printf 'name: caller\non:\n  pull_request: {}\njobs:\n  c:\n    uses: KCTHolman/fleet/.github/workflows/station.yml@main\n' > "$d/.github/workflows/c.yml"
+  mkdir -p "$d/scripts"
+  : > "$d/scripts/nodig.sh"   # het script dat het station uit i28fleet eist (I28 zelf schoon houden)
+  {
+    printf '#!/usr/bin/env bash\n'
+    if [ "$kent" = "--kent-diff" ]; then
+      printf 'while [ $# -gt 0 ]; do case "$1" in --diff) shift ;; esac; shift; done\n'
+    else
+      printf 'case "${1:-}" in --diff) echo "onbekende optie --diff" >&2; echo "FORCE-APPROVAL"; exit 0 ;; esac\n'
+    fi
+    printf '%s\n' "$regel"
+  } > "$d/scripts/sensitive-paths-guard.sh"
+}
+
+guardrepo "$T/i29goed" 'echo "CLEAN: niets gevoeligs"' --kent-diff
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i29goed" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "I29.*leesbaar oordeel"; then
+  ok "guard die het protocol spreekt => schoon"
+else
+  bad "vals-positief op een correcte guard (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# De echte InvestingOS-vorm: kale woorden zonder dubbele punt.
+guardrepo "$T/i29kaal" 'echo "CLEAN"' --kent-diff
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i29kaal" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
+if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "I29"; then
+  ok "kaal 'CLEAN' zonder dubbele punt => harde bevinding"
+else
+  bad "kale verdict-vorm niet gevangen (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# De tweede helft van diezelfde bug: de vlag die het station gebruikt bestaat niet.
+guardrepo "$T/i29geendiff" 'echo "CLEAN: niets gevoeligs"'
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i29geendiff" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
+if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "I29"; then
+  ok "guard die --diff niet kent => harde bevinding"
+else
+  bad "onbekende --diff-vlag niet gevangen (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# Een guard die alleen op `+++`/`---` leest, ziet een PURE hernoeming als een lege diff. Portfolio
+# gaf daar CLEAN op — je kon er elk bestand ongezien de workflowmap mee in verplaatsen. Deze test
+# houdt vast dat een guard óók op die vorm een oordeel moet vellen.
+guardrepo "$T/i29ren" 'if grep -q "^+++" "$2" 2>/dev/null; then echo "CLEAN: gezien"; else exit 0; fi' --kent-diff
+out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i29ren" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?
+if [ "$rc" != 0 ] && printf '%s' "$out" | grep -q "pure hernoeming"; then
+  ok "guard die stil blijft op een pure hernoeming => harde bevinding"
+else
+  bad "hernoemings-blindheid niet gevangen (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
+fi
+
+# Geen guard in de repo => I29 zegt niets. Of die er hoort te zijn, is I28's vraag.
+mkrepo "$T/i29geen" 0
+printf 'name: caller
+on:
+  pull_request: {}
+jobs:
+  c:
+    uses: KCTHolman/fleet/.github/workflows/station.yml@main
+' > "$T/i29geen/.github/workflows/c.yml"
+mkdir -p "$T/i29geen/scripts"; : > "$T/i29geen/scripts/nodig.sh"
+bash "$DOCTOR" --module afhankelijkheden --root "$T/i29geen" --fleet-root "$T/i28fleet" >/dev/null 2>&1
+if [ $? = 0 ]; then ok "geen guard => I29 zwijgt (dat is I28's vraag)"; else bad "I29 klaagt over een repo zonder guard"; fi
 
 # --- I1-REGRESSIE: grote bestanden werden stil overgeslagen -----------------------------------
 # `grep -q` sluit de pijp bij de eerste treffer; `sed` krijgt SIGPIPE en onder `set -o pipefail`
 # leest de pijplijn dan als "geen match". Bij kleine bestanden is sed al klaar vóór grep afsluit,
-# dus de fout was onzichtbaar — juist de GROOTSTE workflows (auto-merge: 547 regels) glipten
+# dus de fout was onzichtbaar — juist de GROOTSTE fleet-workflows (auto-merge: 547 regels) glipten
 # erdoor. Een I1 die precies de zwaarste stations niet toetst, is een groen vinkje dat niets dekt.
 # Vandaar een testbestand met veel regels ná de `runs-on:`-treffer.
 mkrepo "$T/i1groot" 1
@@ -390,7 +477,7 @@ po "eigen drempel (60 dagen)"             actueel   1700000000 1702592000 60 1
 
 echo "fleet-doctor · pin-module op bestandsniveau:"
 
-# De kanarie (de Vloot zelf) hóórt @main te volgen — daar iets van vinden zou I24 omdraaien.
+# De kanarie (deFleet zelf) hóórt @main te volgen — daar iets van vinden zou I24 omdraaien.
 mkrepo "$T/pinfleet" 1
 printf 'name: c\non:\n  push: {}\njobs:\n  c:\n    uses: KCTHolman/fleet/.github/workflows/checks.yml@main\n' > "$T/pinfleet/.github/workflows/c.yml"
 out="$(bash "$DOCTOR" --module pin --root "$T/pinfleet" 2>&1)"; rc=$?
@@ -406,28 +493,18 @@ mkrepo "$T/pinsplit" 0
 printf 'jobs:\n  a:\n    uses: KCTHolman/fleet/.github/workflows/x.yml@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$T/pinsplit/.github/workflows/a.yml"
 printf 'jobs:\n  b:\n    uses: KCTHolman/fleet/.github/workflows/y.yml@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n' > "$T/pinsplit/.github/workflows/b.yml"
 out="$(bash "$DOCTOR" --module pin --root "$T/pinsplit" 2>&1)"; rc=$?
-if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q "VERSCHILLENDE pins"; then
+if [ "$rc" = 1 ] && printf '%s' "$out" | grep -q "VERSCHILLENDE fleet-pins"; then
   ok "twee verschillende pins in één consument => rood"
 else
   bad "verdeelde pins (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
 fi
 
-# Zelfde ont-hardcodeer-test als bij I28 hierboven: onder een ANDERE --fleet-repo mag dezelfde repo
-# niets vinden. Zonder deze test is een hardgecodeerde naam onzichtbaar, want die meldt dan gewoon
-# ✅ — precies de faalvorm die deze module aan de kaak stelt.
-out="$(bash "$DOCTOR" --module pin --root "$T/pinsplit" --fleet-repo "Iemand/anders" 2>&1)"; rc=$?
-if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "niets te pinnen"; then
-  ok "--fleet-repo stuurt ook hier de match"
-else
-  bad "pin-module negeert --fleet-repo (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
-fi
-
-# Een consument die geen enkel station aanroept heeft niets te pinnen.
+# Een consument die geen enkele fleet-workflow aanroept heeft niets te pinnen.
 mkrepo "$T/pinleeg" 0
 printf 'jobs:\n  a:\n    runs-on: ubuntu-latest\n' > "$T/pinleeg/.github/workflows/a.yml"
 out="$(bash "$DOCTOR" --module pin --root "$T/pinleeg" 2>&1)"; rc=$?
 if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q "niets te pinnen"; then
-  ok "geen aanroepen => niets te melden"
+  ok "geen fleet-aanroepen => niets te melden"
 else
   bad "lege consument (rc=$rc): $(printf '%s' "$out" | tr '\n' ' ')"
 fi
