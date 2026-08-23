@@ -234,8 +234,11 @@ lanes:
   light: biohack-light
   fallback: ubuntu-latest
 gates:
-  feature_approval: true    # features wachten op PR-approval
+  feature_approval: true    # BESCHRIJFT sinds 2026-08-23 (zie §4b) — sturend is `autonomy` hieronder
   release_environment: production
+autonomy:                   # §4b — de stand van de repo
+  mode: supervised          # of: autonomous
+  allow_breaking: false     # ook op autonoom wacht een breaking change op een mens
 budgets:
   default_model: claude-sonnet-5
   escalation_model: claude-opus-5   # architectuur-/epic-planwerk
@@ -272,6 +275,90 @@ deploys, domein-crons, release-builds) en de guard-scripts die domeinkennis drag
 **Secrets-contract:** fleet declareert secrets uitsluitend `required: false` met gedocumenteerde
 degradatie (het pick-runner-patroon: geen `RUNNER_CHECK_TOKEN` → fallback, nooit stil falen).
 Consument geeft alles door via `secrets: inherit`. Fleet-repo zelf bevat **nul** secrets.
+
+## 4b. De autonomiestand
+
+Tot 2026-08-23 was autonomie in de Vloot een **eigenschap**, geen keuze: welke beslissingen een
+mens moest nemen lag verspreid over een stuk of tien `if`-takken in `auto-merge.yml`, een handvol
+labels, en een contractsleutel (`gates.feature_approval`) die *geen enkele workflow las*. Je kon
+niet opzoeken in welke stand een repo stond, en je kon 'm niet omzetten zonder de merge-machine te
+bewerken.
+
+De sectie `autonomy` maakt er één schakelaar van, met één resolver eronder:
+[`scripts/autonomie-beslis.sh`](../scripts/autonomie-beslis.sh).
+
+### De twee standen
+
+| | wat de machine doet | wat jij doet |
+|---|---|---|
+| `supervised` | kleine niet-brekende PR's mergen op groen; een feature/breaking PR wacht | je grijpt in om iets te **laten gebeuren** (approval, `plan-goedgekeurd`) |
+| `autonomous` | ook een groene feature-PR merget zichzelf | je grijpt in om iets te **voorkomen** (`needs-human`, `no-automerge`, `FLEET_HALT`) |
+
+Dat is het hele verschil, en het is expres klein: in **beide** standen kan een mens overal
+ingrijpen. Alleen de richting van de default draait om.
+
+### De vloer — wat nooit meeschakelt
+
+Vier poorten liggen in de resolver vóór de schakelaar. Ze sluiten ongeacht de stand:
+
+1. **de gevoelige-paden-guard** — secrets, migraties, de pijplijn zelf, een nieuwe externe
+   bestemming. Daar telt uitsluitend een echte owner-approval. Een consument **zonder**
+   `scripts/sensitive-paths-guard.sh` merget daarom nooit autonoom: de guard valt fail-closed en de
+   PR telt als gevoelig. Dat is geen bug maar de toegangseis — autonomie zonder guard is alleen
+   snelheid zonder rem.
+2. **de noodrem** — repo-variabele `FLEET_HALT`. Elke waarde behalve `0`/`false`/leeg zet de hele
+   repo terug naar mens-in-de-lus. Bewust omgekeerd streng: bij een noodrem is de dure fout dat 'ie
+   niet pakt.
+3. **de stoplabels** — `needs-human` op een issue, `no-automerge` op een PR.
+4. **breaking changes** — die wachten, tenzij het contract expliciet `allow_breaking: true` zegt.
+   Die sleutel staat bewust **alleen** in `.fleet.yml` en niet in de repo-variabele: de dagelijkse
+   stand mag je zonder wrijving omzetten, het plafond niet.
+
+### De volgorde
+
+```
+gevoelig pad → noodrem → stoplabel → breaking
+   → FLEET_AUTONOMY (repo-variabele)
+   → autonomy.stations.<station>
+   → autonomy.mode
+   → geen sectie? mens.
+```
+
+Alles wat niet aantoonbaar autonoom mag, is `mens`. Een onleesbaar contract, een ontbrekende
+PyYAML, een spelfout in de stand: allemaal `mens`, met een reden op stderr. Dat is de omgekeerde
+bias van `noodrem-beslis.sh` (waar een storing juist nóóit remt), en het verschil is de kostbare
+fout: daar is dat een PR die onnodig wacht, hier is dat een merge die niemand heeft gezien.
+
+### Omzetten
+
+Zonder PR, met [`scripts/autonomie.sh`](../scripts/autonomie.sh):
+
+```bash
+bash scripts/autonomie.sh status              # de stand van alle consumenten
+bash scripts/autonomie.sh set KCTHolman/Portfolio autonomous
+bash scripts/autonomie.sh halt KCTHolman/BiohackOS    # noodrem om
+```
+
+### Beslispunten ≠ stations
+
+`autonomy.stations` is een andere lijst dan `budgets.max_turns` (`triage`, `plan`, `build`,
+`review`, `autofix`, `conflict`), en dat verschil is inhoudelijk: turn-budgetten gaan over wat er
+**draait**, autonomie over wie **beslist**. `build` beslist niets, `merge` draait niets. De
+validator houdt beide lijsten apart.
+
+**Vandaag kent `autonomy.stations` precies één beslispunt: `merge`** — het enige dat de resolver
+daadwerkelijk aanroept (`auto-merge.yml`). `triage`, `plan` en `release` zijn echte beslispunten in
+de pijplijn, maar staan er bewust **niet** in zolang geen workflow ze uitleest.
+
+Dat is geen bescheidenheid maar de hele reden dat deze sectie bestaat. `gates.feature_approval`
+stond twee jaar in elk contract zonder ooit gelezen te worden: je zette 'm, er gebeurde niets, en
+niets werd rood. Een station alvast toelaten "omdat we het later wiren" bouwt diezelfde stilte
+opnieuw. Nu is `stations.triage` een **harde fout in CI** in plaats van een instelling die niets
+doet.
+
+De lijst groeit per gewired station, in dezelfde PR die 'm wiret — één regel in
+`check-fleet-yml.py`, één in `autonomie-beslis.sh`, en de bijbehorende test verhuist van "fout"
+naar "geldig".
 
 ## 5. Runner-substraat en capaciteit
 

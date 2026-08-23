@@ -115,6 +115,44 @@ verwacht "areas met kapotte regex" ongeldig \
 verwacht "areas met foute kleur" ongeldig \
   "$(geldig_contract "$(printf 'areas:\n  - label: "area: web"\n    paths: "^web/"\n    color: "#C5DEF5"\n')")" "6 hex-tekens"
 
+echo "check-fleet-yml · autonomy (de stand van de repo):"
+
+# WAAROM DEZE SECTIE ZWAARDER GETOETST WORDT DAN Z'N OMVANG SUGGEREERT. Een fout in `lanes` merk
+# je binnen één run (de job vindt geen runner). Een fout in `autonomy` merk je NOOIT: de resolver
+# valt bij twijfel terug op `mens`, dus een verkeerd gespelde stand ziet eruit als een repo die
+# gewoon nog begeleid draait. Precies de klasse stilte waar deze validator voor bestaat.
+
+verwacht "geen autonomy-sectie is geldig (migratiepad)" geldig "$(geldig_contract)"
+
+verwacht "mode supervised" geldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n')")"
+verwacht "mode autonomous met stations en allow_breaking" geldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: autonomous\n  allow_breaking: true\n  stations:\n    merge: supervised\n')")"
+verwacht "nederlandse standen" geldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: autonoom\n  stations:\n    merge: mens\n')")"
+
+verwacht "autonomy zonder mode" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  allow_breaking: true\n')")" "verplichte sleutel .autonomy.mode."
+verwacht "onbekende sleutel in autonomy" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  modus: autonomous\n')")" "onbekende sleutel .autonomy.modus."
+verwacht "mode met een waarde die geen stand is" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: full\n')")" "geldig: supervised"
+verwacht "onbekend beslispunt" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  stations:\n    build: autonomous\n')")" "onbekend beslispunt .autonomy.stations.build."
+
+# `triage` IS een beslispunt in de pijplijn — maar nog niet gewired op de resolver. Dat moet rood
+# zijn, niet stilzwijgend geaccepteerd: anders zet iemand `stations.triage: autonomous` en gelooft
+# dat het werkt, precies de faalvorm van `gates.feature_approval` die deze sectie repareert.
+# Zodra triage gewired wordt, verhuist deze regel naar de geldige gevallen hierboven.
+verwacht "beslispunt dat nog niet gewired is (triage)" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  stations:\n    triage: autonomous\n')")" "onbekend beslispunt .autonomy.stations.triage."
+verwacht "beslispunt met onzin-stand" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  stations:\n    merge: soms\n')")" "geldig: supervised of autonomous"
+verwacht "allow_breaking als string" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  allow_breaking: "ja"\n')")" "moet bool"
+verwacht "stations als lijst i.p.v. mapping" ongeldig \
+  "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  stations:\n    - merge\n')")" "moet een mapping zijn"
+
 echo "check-fleet-yml · het echte contract van deze repo:"
 out="$(python "$V" .fleet.yml 2>&1)"; rc=$?
 [ "$rc" = 0 ] && ok "deFleet's eigen .fleet.yml is geldig" || { bad "deFleet's eigen .fleet.yml"; printf '%s\n' "$out" | sed 's/^/      /'; }

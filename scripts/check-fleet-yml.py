@@ -37,6 +37,27 @@ except ImportError:  # pragma: no cover
 # station dat niet bestaat is altijd een typefout, nooit vooruitziendheid.
 STATIONS = {"triage", "plan", "build", "review", "autofix", "conflict"}
 
+# De BESLISPUNTEN die een eigen autonomiestand mogen dragen. Bewust een ANDERE lijst dan STATIONS
+# hierboven, en dat verschil is inhoudelijk: `budgets.max_turns` gaat over wat er DRAAIT (een agent
+# die turns verbruikt), `autonomy.stations` over wie er BESLIST. `build` heeft daarom geen
+# autonomiestand (een bouwstap beslist niets, die voert uit) en `merge` geen turn-budget (daar
+# draait geen agent, daar valt een besluit).
+#
+# DEZE LIJST BEVAT ALLEEN WAT ÉCHT WORDT GELEZEN, en dat is de hele reden dat de sectie `autonomy`
+# bestaat. `gates.feature_approval` stond twee jaar in elk contract zonder dat één workflow 'm las:
+# je zette 'm, er gebeurde niets, en niets werd rood. Zou hier `triage` of `release` staan terwijl
+# alleen `auto-merge.yml` de resolver aanroept, dan bouwden we diezelfde stille faalvorm meteen
+# opnieuw — nu met het argument "die wiren we later".
+#
+# De lijst groeit dus PER GEWIRED STATION, in dezelfde PR die 'm wiret. Eén regel hier, één regel
+# in autonomie-beslis.sh. Zet iemand nu een station dat er niet in staat, dan is dat rood in CI en
+# niet stil in productie.
+AUTONOMIE_STATIONS = {"merge"}
+
+# De twee standen, met hun Nederlandse synoniemen. De schakelaar wordt ook met de hand gezet
+# (`gh variable set FLEET_AUTONOMY`), en dan is `autonoom` de waarde die je intikt.
+AUTONOMIE_WAARDEN = {"supervised", "autonomous", "mens", "begeleid", "autonoom"}
+
 SCHEMA = {
     "version": {"type": int, "required": True},
     "lanes": {
@@ -73,6 +94,22 @@ SCHEMA = {
             "task": {"type": str, "required": True},
             "human": {"type": str, "required": True},
             "epic": {"type": str, "required": False},
+        },
+    },
+    # `autonomy` — de stand van de repo: beslist de machine zelf, of hoort er een mens aan te pas?
+    #
+    # OPTIONEEL, en dat is een migratiekeuze, geen slordigheid. Een consument zonder deze sectie
+    # draait zoals hij vóór de schakelaar draaide (autonomie-beslis.sh valt dan terug op `mens`).
+    # De sectie TOEVOEGEN is dus de bewuste keuze; hem weglaten verandert niets. Zou deze sectie
+    # verplicht zijn, dan was elke bestaande consument van de ene op de andere dag rood — en dan
+    # wordt 'ie ingevuld om het rood weg te krijgen, niet omdat iemand de stand koos.
+    "autonomy": {
+        "type": dict,
+        "required": False,
+        "keys": {
+            "mode": {"type": str, "required": True},
+            "stations": {"type": dict, "required": False},
+            "allow_breaking": {"type": bool, "required": False},
         },
     },
     "spine": {"type": list, "required": False},
@@ -171,6 +208,34 @@ def main():
                 )
             elif not isinstance(waarde, int) or isinstance(waarde, bool) or waarde <= 0:
                 fouten.append(f"`budgets.max_turns.{station}` moet een positief geheel getal zijn")
+
+    autonomy = data.get("autonomy")
+    if isinstance(autonomy, dict):
+        # Een onbekende WAARDE is hier net zo gevaarlijk als een onbekende SLEUTEL elders in dit
+        # bestand, en om dezelfde reden. `mode: auto` of `mode: full` leest voor een mens als
+        # "autonoom", maar autonomie-beslis.sh kent die waarden niet en valt terug op `mens` —
+        # de repo staat dan in een stand die niemand koos, en niets is er rood van.
+        mode = autonomy.get("mode")
+        if isinstance(mode, str) and mode.lower() not in AUTONOMIE_WAARDEN:
+            fouten.append(
+                f"`autonomy.mode` is {mode!r} — geldig: supervised (mens/begeleid) of "
+                f"autonomous (autonoom)"
+            )
+
+        stations = autonomy.get("stations")
+        if stations is not None and not isinstance(stations, dict):
+            fouten.append("`autonomy.stations` moet een mapping zijn van station → stand")
+        elif isinstance(stations, dict):
+            for station, stand in stations.items():
+                if station not in AUTONOMIE_STATIONS:
+                    fouten.append(
+                        f"onbekend beslispunt `autonomy.stations.{station}` — "
+                        f"bekend: {', '.join(sorted(AUTONOMIE_STATIONS))}"
+                    )
+                if not isinstance(stand, str) or stand.lower() not in AUTONOMIE_WAARDEN:
+                    fouten.append(
+                        f"`autonomy.stations.{station}` is {stand!r} — geldig: supervised of autonomous"
+                    )
 
     spine = data.get("spine")
     if isinstance(spine, list):

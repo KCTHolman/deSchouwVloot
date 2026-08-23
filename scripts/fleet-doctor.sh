@@ -10,7 +10,6 @@
 #   scripts/fleet-doctor.sh --module spine        --repo <owner/naam> [--spine "a.yml,b.yml"]
 #   scripts/fleet-doctor.sh --module runners      --repo <owner/naam>
 #   scripts/fleet-doctor.sh --module liveness     --repo <owner/naam> [--grace-min 30]
-#   scripts/fleet-doctor.sh --module afhankelijkheden --root . --fleet-root <checkout van deze repo>
 #   scripts/fleet-doctor.sh --module pin          [--root .] [--pin-drempel-dagen 7]
 #
 # `consistentie` is puur bestandsgebaseerd → offline testbaar (fleet-doctor.test.sh). `spine`,
@@ -32,10 +31,9 @@ spine_list="auto-merge.yml,pr-check.yml,epic-orchestrator.yml,reconciler-cron.ym
 # Speling tussen "de bron is klaar" en "de luisteraar is begonnen". Ruim genoeg dat een run die
 # NET voltooide geen vals alarm geeft, krap genoeg dat een dode trigger binnen het uur opvalt.
 grace_min=30
-# Hoeveel dagen een consument-pin achter het hoofd van deze repo mag lopen vóór het een harde
-# bevinding is (I24). Bewust ruim: de bump-baan opent per nieuwe groene canary-commit een PR, dus
-# zeven dagen achterstand betekent niet "er is iets nieuwers" maar "die baan komt er al een week
-# niet doorheen".
+# Hoeveel dagen een consument-pin achter fleet's hoofd mag lopen vóór het een harde bevinding is
+# (I24). Bewust ruim: de bump-baan opent per nieuwe groene canary-commit een PR, dus zeven dagen
+# achterstand betekent niet "er is iets nieuwers" maar "die baan komt er al een week niet doorheen".
 pin_drempel=7
 
 die() { echo "✋ fleet-doctor: $*" >&2; exit 2; }
@@ -49,9 +47,8 @@ while [ $# -gt 0 ]; do
     --spine)      shift; spine_list="${1:-}" ;;
     --grace-min)  shift; grace_min="${1:-}" ;;
     --pin-drempel-dagen) shift; pin_drempel="${1:-}" ;;
-    # Pad naar een checkout van DEZE repo naast die van de consument. I28 leest de eis uit de
-    # stationsdefinities zelf, zodat er geen handmatige lijst is die achterloopt. In doctor.yml
-    # staat die checkout al klaar als `.fleet-doctor`.
+    # Pad naar een checkout van de fleet-repo (I28 leest de eisen uit de stationsdefinities zelf,
+    # zodat er geen handmatige lijst is die achterloopt). In doctor.yml is dat `.fleet-doctor`.
     --fleet-root) shift; fleet_root="${1:-}" ;;
     *) die "onbekend argument: $1" ;;
   esac
@@ -98,11 +95,13 @@ module_consistentie() {
 
       # Eigen trigger gevonden — draagt dit bestand eigen logica of is het een pure caller?
       #
-      # `grep -c` EN NIET `grep -q`. `-q` stopt bij de eerste treffer en sluit de pijp; `sed` krijgt
-      # dan SIGPIPE en de pijplijn eindigt onder `set -o pipefail` op 141 — ook al wás er een match.
-      # Dat speelt alleen bij grote bestanden, want daar heeft sed nog werk liggen als grep al klaar
-      # is. `-c` leest de invoer uit en telt, en is daarmee ongevoelig voor die race.
-      # `fleet-doctor.test.sh` houdt dit vast met een regressiegeval van 800 regels.
+      # `grep -c` EN NIET `grep -q` (gevonden 2026-08-16). `-q` stopt bij de eerste treffer en
+      # sluit de pijp; `sed` krijgt dan SIGPIPE en de pijplijn eindigt onder `set -o pipefail` op
+      # 141 — ook al wás er een match. Het gevolg hier was een I1 die precies bij de GROOTSTE
+      # bestanden niets zag: daar heeft sed nog werk liggen als grep al klaar is, bij kleine
+      # bestanden niet. Een fleet-workflow met eigen logica én een eigen trigger kon zo groen
+      # passeren, en dat is exact de storing die I1 moet vangen. Gevonden doordat een nieuwe check
+      # met hetzelfde patroon auto-merge/gitflow-doctor/pr-label oversloeg.
       local heeft_logica
       heeft_logica="$(sed -E 's/(^|[[:space:]])#.*$//' "$f" | grep -cE '^\s{4}(steps:|runs-on:)' || true)"
       if [ "${heeft_logica:-0}" -gt 0 ]; then
@@ -258,40 +257,31 @@ module_spine() {
 # MODULE afhankelijkheden — I28. Roept een station een script aan dat de consument niet heeft?
 # ---------------------------------------------------------------------------------------------
 #
-# Een station draait in de werkmap van de CONSUMENT. Roept het daar `scripts/foo.sh` aan, dan is
-# dat een harde eis aan die consument — maar nergens staat opgeschreven dát het een eis is. Met
+# Een fleet-station draait in de werkmap van de CONSUMENT. Roept het daar `scripts/foo.sh` aan, dan
+# is dat een harde eis aan die consument — maar nergens staat opgeschreven dát het een eis is. Met
 # één consument valt dat nooit op, want daar staat het script gewoon.
 #
-# Gemeten 2026-07-28 bij het aanhaken van een tweede consument: `auto-merge` roept
-# `scripts/sensitive-paths-guard.sh` aan en dat bestaat daar niet. Het gedrag is netjes
-# fail-closed (elke PR wacht dan op een mens), en juist DAAROM is het gevaarlijk: er wordt niets
-# rood, de spine "werkt", en niemand merkt dat 'ie per constructie nooit meer merget.
-#
-# Zelfde faalvorm die I23 bij de golden-set afkeurde en die I27 bij triggers vangt: een uitkomst
-# die altijd hetzelfde is, ziet er van buiten uit als een werkende check. Zie het kopje
-# "Groen is geen bewijs" in README.md — dit is het derde bewijspunt van dat patroon.
+# Gevonden 2026-07-28 bij InvestingOS: `auto-merge` roept `scripts/sensitive-paths-guard.sh` aan en
+# dat bestaat daar niet. Het gedrag is netjes fail-closed (elke PR wacht dan op een mens), en juist
+# dáárom is het gevaarlijk: er wordt niets rood, de spine "werkt", en niemand merkt dat 'ie per
+# constructie nooit meer merget. Zelfde faalvorm die I23 bij de golden-set afkeurde — een uitkomst
+# die altijd hetzelfde is, ziet er van buiten uit als een werkende check.
 #
 # Deze module leest de eis uit de stationsdefinitie zelf (dus geen handmatig bijgehouden lijst die
-# achterloopt) en toetst 'm tegen de consument. Vereist een checkout van deze repo naast die van
-# de consument — in doctor.yml staat die in `.fleet-doctor`.
+# achterloopt) en toetst 'm tegen de consument. Vereist een checkout van fleet naast die van de
+# consument — in doctor.yml staat die in `.fleet-doctor`.
 module_afhankelijkheden() {
   [ -d "$wf_dir" ] || { warn "geen $wf_dir — niets te controleren"; return; }
   if [ -z "$fleet_root" ] || [ ! -d "$fleet_root/.github/workflows" ]; then
-    warn "I28: geen checkout meegegeven (--fleet-root) — afhankelijkheden ongetoetst"
+    warn "I28: geen fleet-checkout meegegeven (--fleet-root) — afhankelijkheden ongetoetst"
     return
   fi
 
-  # De verwijzing die we zoeken is `<fleet_repo>/.github/workflows/<station>.yml@<ref>`. Bewust
-  # via $fleet_repo (dezelfde vlag die I24 al gebruikt) en NIET hardgecodeerd: deze logica wordt
-  # onder meer dan één repo-naam aangeroepen, en een hardgecodeerde naam laat de module
-  # stilzwijgend niets vinden en dus altijd ✅ melden — precies de faalvorm die I28 zelf aan de
-  # kaak stelt. Punten in een repo-naam escapen, anders zijn het regex-jokers.
-  local repo_re refs
-  repo_re="$(printf '%s' "$fleet_repo" | sed 's/[.[\*^$]/\\&/g')"
-  refs="$(grep -rhoE "$repo_re/\.github/workflows/[A-Za-z0-9_.-]+\.yml@" "$wf_dir" 2>/dev/null \
+  local refs
+  refs="$(grep -rhoE "KCTHolman/fleet/\.github/workflows/[A-Za-z0-9_.-]+\.yml@" "$wf_dir" 2>/dev/null \
     | sed -E 's|.*/||; s|@$||' | sort -u)"
   if [ -z "$refs" ]; then
-    ok "I28: deze repo roept geen stations van $fleet_repo aan"
+    ok "I28: deze repo roept geen fleet-stations aan"
     return
   fi
 
@@ -300,7 +290,7 @@ module_afhankelijkheden() {
     [ -n "$station" ] || continue
     [ -f "$fleet_root/.github/workflows/$station" ] || continue
     # `bash scripts/x.sh` met een SPATIE ervoor: zo vallen `.fleet-doctor/scripts/...` en
-    # `.fleet-lib/scripts/...` er automatisch buiten — dat zijn onze eigen checkouts in de
+    # `.fleet-lib/scripts/...` er automatisch buiten — dat zijn fleet's eigen checkouts in de
     # werkmap van de consument, geen eis aan de consument.
     nodig="$(grep -ohE '(bash|sh) scripts/[A-Za-z0-9_.-]+\.sh' "$fleet_root/.github/workflows/$station" 2>/dev/null \
       | sed -E 's/^(bash|sh) //' | sort -u)"
@@ -320,6 +310,81 @@ module_afhankelijkheden() {
   elif [ "$i28" = 0 ]; then
     ok "I28: alle scripts die de $getoetst aangeroepen stations nodig hebben, staan er"
   fi
+
+  module_verdictprotocol
+}
+
+# ---------------------------------------------------------------------------------------------
+# I29 — spreekt de guard de taal die het station leest?
+# ---------------------------------------------------------------------------------------------
+#
+# I28 toetst of het bestand BESTAAT. Dat is niet genoeg, en dat is gemeten.
+#
+# InvestingOS' `sensitive-paths-guard.sh` bestond, was 282 regels lang, had een eigen self-test en
+# was strenger dan die van de andere twee consumenten — en tóch zou `auto-merge` er nooit een
+# CLEAN uit gelezen hebben. Twee redenen: het script kende de vlag `--diff` niet (het station geeft
+# een unified diff mee, geen padlijst), en het printte de KALE woorden terwijl het station op
+# `^CLEAN:` en `^FORCE-APPROVAL:` grept — mét dubbele punt.
+#
+# De uitkomst was fail-closed, dus veilig. Maar ook stil, en permanent: elke PR zou op een mens
+# wachten terwijl de merge-machine er groen en werkend uitziet. Exact de faalvorm die I28 zelf
+# beschrijft ("een uitkomst die altijd hetzelfde is, ziet er van buiten uit als een werkende
+# check") — alleen één laag dieper, en daar keek niets.
+#
+# HET CONTRACT DAT HIER GETOETST WORDT is geen nieuwe afspraak maar wat auto-merge.yml al doet:
+#
+#     guard_out="$(bash scripts/sensitive-paths-guard.sh --diff "$diff_file" 2>&1 || true)"
+#     grep -q '^FORCE-APPROVAL:'  → gevoelig
+#     grep -q '^CLEAN:'           → schoon
+#     anders                      → fail-closed
+#
+# We toetsen alleen de VORM, nooit het oordeel. Wélke paden gevoelig zijn is per definitie
+# domeinkennis van de consument (dat is de hele reden dat dit script daar staat en niet hier);
+# dát er een leesbaar oordeel uit komt, is dat niet.
+module_verdictprotocol() {
+  local guard="$root/scripts/sensitive-paths-guard.sh"
+  [ -f "$guard" ] || return 0   # I28 heeft hier al over geklaagd als een station 'm nodig had
+
+  command -v bash >/dev/null 2>&1 || { warn "I29: geen bash om de guard te proeven"; return; }
+
+  local tmp uit fout=0
+  tmp="$(mktemp)"
+
+  # Twee vormen, allebei uit de echte praktijk. De tweede is een PURE hernoeming: die produceert
+  # géén `+++`/`---`-regels, en een guard die alleen daarop leest ziet 'm als een lege diff.
+  # Portfolio's guard gaf daar CLEAN op — je kon er elk bestand ongezien de workflowmap mee in
+  # verplaatsen (gerepareerd 2026-08-23).
+  local -a vormen=(
+    "gewone wijziging|diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,2 @@
+ x
++y
+"
+    "pure hernoeming|diff --git a/README.md b/.github/workflows/x.yml
+similarity index 100%
+rename from README.md
+rename to .github/workflows/x.yml
+"
+  )
+
+  local paar naam inhoud
+  for paar in "${vormen[@]}"; do
+    naam="${paar%%|*}"; inhoud="${paar#*|}"
+    printf '%s' "$inhoud" > "$tmp"
+    # Zelfde aanroepvorm als het station, inclusief het lege GITHUB_OUTPUT en de `|| true`.
+    uit="$(GITHUB_OUTPUT='' bash "$guard" --diff "$tmp" 2>&1 || true)"
+    if printf '%s' "$uit" | grep -qE '^(FORCE-APPROVAL|CLEAN):'; then
+      ok "I29: guard geeft een leesbaar oordeel op een $naam"
+    else
+      bad "I29: guard geeft GEEN leesbaar oordeel op een $naam — auto-merge valt hier fail-closed terug op een mens, permanent en zonder dat iets rood wordt. Verwacht een regel die met \`CLEAN:\` of \`FORCE-APPROVAL:\` begint (mét dubbele punt); kreeg: $(printf '%s' "$uit" | head -1)"
+      fout=1
+    fi
+  done
+
+  rm -f "$tmp"
+  [ "$fout" = 0 ] || true
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -400,18 +465,18 @@ module_liveness() {
     # vanuit een andere workflow, herkenbaar aan actor `github-actions[bot]`. De luisteraar kán op
     # zo'n run niet reageren, dus 'm afrekenen op die stilte is per constructie vals alarm.
     #
-    # Geverifieerd bij een consument (2026-08-01): runs via `issues` (actor `claude[bot]` of een
-    # mens) gaven élke keer een vervolgrun; drie opeenvolgende `workflow_dispatch`-runs door
-    # `github-actions[bot]` géén enkele. Omdat juist de raket die dispatch-route continu gebruikt,
-    # wás de nieuwste bron-run bijna altijd zo'n gesmoorde — I27 stond daardoor permanent hard
-    # rood, en via de fail-teller van auto-merge hield dat de complete merge-poort dicht.
+    # Geverifieerd in BiohackOS (2026-08-01): claude.yml-runs via `issues` (actor `claude[bot]` of
+    # een mens) gaven élke keer een reconciler-cron-run; drie opeenvolgende `workflow_dispatch`-runs
+    # door `github-actions[bot]` géén enkele. Omdat juist de raket die dispatch-route continu
+    # gebruikt, wás de nieuwste bron-run bijna altijd zo'n gesmoorde — I27 stond daardoor permanent
+    # hard rood, en via de fail-teller van auto-merge hield dat de complete merge-poort dicht.
     #
     # EN: een bron-run die NÉT is afgerond kan nog geen reactie hebben. De speling hieronder vangt
     # dat alleen als de luisteraar kórt vóór de bron draaide; stond z'n vorige run langer terug —
     # volkomen normaal, er liep in de tussentijd simpelweg geen bron — dan las I27 een reactie die
-    # nog in de maak was als een dode trigger. Gemeten 2026-08-01: de bron rondde af om 09:17:09,
-    # de reactie erop ontstond om 09:17:11, en de doctor las de luisteraarslijst net dáárvoor →
-    # hard rood op een keten die perfect werkte.
+    # nog in de maak was als een dode trigger. Gemeten 2026-08-01: feature-governance rondde af om
+    # 09:17:09, de auto-merge-run erop ontstond om 09:17:11, en de doctor las de luisteraarslijst
+    # net dáárvoor → hard rood op een keten die perfect werkte.
     #
     # Daarom tellen alleen bron-runs mee die minstens één speling geleden AFRONDDEN (`updated_at`).
     # Samen met de actor-filter: de nieuwste voltooide bron-run die het event WÉL kón afgeven én
@@ -463,32 +528,31 @@ module_liveness() {
 # MODULE pin — I24. Een pin die niet meer opschuift is verstarring, niet veiligheid.
 # ---------------------------------------------------------------------------------------------
 #
-# WAT DEZE MODULE TOEVOEGT. I24 werd eerder afgedekt door `doctor:consistentie`, en die module
-# toetst het PÁD van een verwijzing — niet de ref erachter. Pin-achterstand viel daar dus buiten.
-# Dat is een subtiel gat: een achterlopende pin leest van buiten als GROEN, omdat doctor.yml een
-# module die de gepinde doctor nog niet kent netjes overslaat met een ⚠️. Zachte degradatie is
-# precies goed voor scheefstand, maar zonder tegenhanger zou "meer achterstand" tot "minder harde
-# bevindingen" leiden. Deze module is die tegenhanger.
+# WAAROM DIT ER NIET WAS EN WEL MOEST KOMEN. I24 stond in gitflow.md toegewezen aan
+# `doctor:consistentie`, maar die module toetst alleen het PÁD van een verwijzing — niet de ref
+# erachter. Niets merkte dus dat een consument maanden op dezelfde fleet-commit stond. Erger: een
+# achterlopende pin degradeert naar GROEN, want doctor.yml slaat een module die de gepinde doctor
+# nog niet kent netjes over met een ⚠️. Dat is de juiste behandeling voor scheefstand, maar zonder
+# tegenhanger betekent het dat "meer achterstand" leidt tot "minder harde bevindingen".
 #
 # Twee dingen worden hier hard:
-#   • ACHTERSTAND — de gepinde commit is ouder dan de drempel t.o.v. het hoofd van deze repo. Niet
-#     "er is een nieuwere commit" (dan zou élke push elke consument rood zetten), maar "de
-#     bump-baan is er al dagen niet in geslaagd 'm door te schuiven", en dát is een storing in de
-#     baan zelf.
+#   • ACHTERSTAND — de gepinde commit is ouder dan de drempel t.o.v. fleet's hoofd. Niet "er is een
+#     nieuwere commit" (dan zou élke fleet-push elke consument rood zetten), maar "de bump-baan is
+#     er al dagen niet in geslaagd 'm door te schuiven", en dát is een storing in de baan zelf.
 #   • VERDEELDHEID — meer dan één distinct SHA in dezelfde repo. Dat is een half gelukte bump: de
 #     ene helft van de callers roept nieuwe logica aan, de andere oude. Dat is geen achterstand
 #     maar inconsistentie, en die is per definitie ongetest.
 
 # Pure beslisser, zelfde patroon als liveness_oordeel: geen netwerk, geen klok, alles als argument.
 #   $1 = epoch van de gepinde commit (0 = onbekend)
-#   $2 = epoch van de hoofdcommit van deze repo (0 = onbekend)
+#   $2 = epoch van fleet's hoofdcommit (0 = onbekend)
 #   $3 = drempel in dagen
 #   $4 = aantal distinct SHA-refs in de repo
 pin_oordeel() {
   local gepind="${1:-0}" hoofd="${2:-0}" drempel="${3:-7}" n_refs="${4:-0}"
   [ "$n_refs" -gt 1 ] && { echo "verdeeld"; return; }
   [ "$n_refs" -eq 0 ] && { echo "ongepind"; return; }
-  # Niet kunnen meten is geen bevinding. Een SHA die de API niet teruggeeft (force-push, andere
+  # Niet kunnen meten is geen bevinding. Een SHA die de API niet teruggeeft (force-push, ander
   # repo) moet zichtbaar zijn als "onbekend", niet als "verouderd" — anders is de eerste keer dat
   # deze module iets zegt meteen een vals alarm.
   { [ "$gepind" -eq 0 ] || [ "$hoofd" -eq 0 ]; } && { echo "onbekend"; return; }
@@ -506,21 +570,17 @@ module_pin() {
   local is_fleet=0
   [ -f "$root/docs/architectuur.md" ] && [ -f "$root/routing.yml" ] && is_fleet=1
   if [ "$is_fleet" = 1 ]; then
-    # Deze repo is zelf de KANARIE (gitflow §13.D): die hóórt zichzelf op `@main` te volgen, anders
-    # test 'ie niet de nieuwste commit maar zichzelf. Hier iets van vinden zou de invariant omdraaien.
+    # deFleet is de KANARIE (gitflow §13.D): die hóórt zichzelf op `@main` te volgen, anders test
+    # 'ie niet de nieuwste commit maar zichzelf. Hier iets van vinden zou de invariant omdraaien.
     ok "I24: deze repo is de kanarie — volgt \`@main\` en heeft per ontwerp geen pin"
     return
   fi
 
-  # Zelfde ont-hardcodering als I28: via $fleet_repo, met geëscapete punten. Een hardgecodeerde
-  # repo-naam laat deze module onder een andere naam stilzwijgend niets vinden en dus altijd ✅
-  # melden — de faalvorm die deze module nou juist aan de kaak stelt.
-  local repo_re alle refs branches
-  repo_re="$(printf '%s' "$fleet_repo" | sed 's/[.[\*^$]/\\&/g')"
-  alle="$(grep -rhoE "$repo_re/\.github/workflows/[A-Za-z0-9_.-]+\.yml@[A-Za-z0-9_.:/-]+" \
+  local alle refs branches
+  alle="$(grep -rhoE "KCTHolman/fleet/\.github/workflows/[A-Za-z0-9_.-]+\.yml@[A-Za-z0-9_.:/-]+" \
     "$wf_dir" 2>/dev/null | sed -E 's/.*@//' | sort -u)"
   if [ -z "$alle" ]; then
-    ok "I24: deze repo roept geen stations van $fleet_repo aan — niets te pinnen"
+    ok "I24: deze repo roept geen fleet-workflows aan — niets te pinnen"
     return
   fi
   # SHA's scheiden van branch-/tagnamen: alleen een volle 40-hex is een echte pin.
@@ -531,18 +591,17 @@ module_pin() {
   [ -n "$refs" ] && n_refs="$(printf '%s\n' "$refs" | grep -c . || true)"
 
   # De bump-baan (`bump-pin.yml`) volgt bewust `@main` — dat is de ontpin-knop, geen scheefstand.
-  # Elke ándere branch-ref is er wel één: die caller beweegt mee met elke push naar deze repo.
+  # Elke ándere branch-ref is er wel één: die caller beweegt mee met elke fleet-push.
   if [ -n "$branches" ]; then
     local losse
-    losse="$(grep -rlE "$repo_re/\.github/workflows/[A-Za-z0-9_.-]+\.yml@(main|master)" "$wf_dir" 2>/dev/null \
+    losse="$(grep -rlE "KCTHolman/fleet/\.github/workflows/[A-Za-z0-9_.-]+\.yml@(main|master)" "$wf_dir" 2>/dev/null \
       | xargs -r -n1 basename | grep -v '^bump-pin\.yml$' | tr '\n' ' ' || true)"
     [ -n "$(printf '%s' "$losse" | tr -d ' ')" ] \
-      && warn "I24: deze caller(s) volgen een branch i.p.v. een SHA: $losse — elke push naar $fleet_repo landt daar ongetest"
+      && warn "I24: deze caller(s) volgen een branch i.p.v. een SHA: $losse — elke fleet-push landt daar ongetest"
   fi
 
-  # Datums ophalen. De bronrepo kan privé zijn, dus dit vraagt een app-token; die staat als
-  # FLEET_TOKEN in de omgeving (doctor.yml zet 'm). Zonder token is dit niet meetbaar — en dat
-  # zeggen we, in plaats van het als achterstand te lezen.
+  # Datums ophalen. De fleet-repo is privé, dus dit vraagt de app-token; die staat als FLEET_TOKEN
+  # in de omgeving (doctor.yml zet 'm). Zonder token is dit niet meetbaar — en dat zeggen we.
   local tok="${FLEET_TOKEN:-${GH_TOKEN:-}}"
   local gepind_sha hoofd_sha="" gepind_iso="" hoofd_iso="" gepind_e=0 hoofd_e=0
   gepind_sha="$(printf '%s\n' "$refs" | head -1)"
@@ -563,13 +622,13 @@ module_pin() {
     ongepind)
       warn "I24: geen enkele SHA-pin gevonden — deze consument volgt een branch. Pinnen is de eis; de bump-baan schuift 'm daarna vanzelf door" ;;
     verdeeld)
-      bad "I24: $n_refs VERSCHILLENDE pins in dezelfde repo ($(printf '%s' "$refs" | tr '\n' ' ')) — een half gelukte bump. De ene helft van de callers draait andere logica dan de andere, en die combinatie is nooit als geheel getest" ;;
+      bad "I24: $n_refs VERSCHILLENDE fleet-pins in dezelfde repo ($(printf '%s' "$refs" | tr '\n' ' ')) — een half gelukte bump. De ene helft van de callers draait andere logica dan de andere, en die combinatie is nooit als geheel getest" ;;
     onbekend)
-      warn "I24: kon de datum van pin \`${gepind_sha:0:7}\` of van het hoofd van $fleet_repo niet ophalen — achterstand ongetoetst (token/rechten?)" ;;
+      warn "I24: kon de datum van pin \`${gepind_sha:0:7}\` of van fleet's hoofdcommit niet ophalen — achterstand ongetoetst (token/rechten?)" ;;
     verouderd)
-      bad "I24: de pin \`${gepind_sha:0:7}\` is $dagen dagen ouder dan het hoofd \`${hoofd_sha:0:7}\` (drempel $pin_drempel). Niet 'er is iets nieuwers' — de bump-baan had dit al lang moeten doorschuiven, dus die baan is zelf stuk of staat uit" ;;
+      bad "I24: de pin \`${gepind_sha:0:7}\` is $dagen dagen ouder dan fleet's hoofd \`${hoofd_sha:0:7}\` (drempel $pin_drempel). Niet 'er is iets nieuwers' — de bump-baan had dit al lang moeten doorschuiven, dus die baan is zelf stuk of staat uit" ;;
     actueel)
-      ok "I24: pin \`${gepind_sha:0:7}\` loopt $dagen dag(en) achter op het hoofd — binnen de drempel van $pin_drempel" ;;
+      ok "I24: pin \`${gepind_sha:0:7}\` loopt $dagen dag(en) achter op fleet's hoofd — binnen de drempel van $pin_drempel" ;;
   esac
 }
 
@@ -637,6 +696,89 @@ module_contract() {
     done
     hard=$((hard + 1))
   fi
+
+  module_labelwoordenboek "$f" "$py"
+}
+
+# ---------------------------------------------------------------------------------------------
+# I30 — bestaan de labels uit het contract ook echt in de repo?
+# ---------------------------------------------------------------------------------------------
+#
+# `.fleet.yml` heeft een VERPLICHTE sectie `labels:` met `task`, `human` en (optioneel) `epic`.
+# Elke consument moet 'm invullen. En tot vandaag las geen enkel station 'm: gevalideerd,
+# afgedwongen, en volledig decoratief.
+#
+# Dat is niet onschuldig, want de sectie draagt een echte belofte. Het commentaar in élk contract
+# zegt het zo: "Labels reizen NIET mee bij een issue-transfer — alleen namen die in de doelrepo al
+# bestaan overleven de verhuizing. Deze drie moet elke consument garanderen." Fleet's `intake.yml`
+# verhuist issues tussen repo's; een label dat in de doelrepo niet bestaat, valt daar stil weg.
+# De belofte was dus dat die drie er zijn — en niets controleerde dat.
+#
+# De garantie hing aan `scripts/ensure-labels.sh`, en die bestaat in precies één van de vijf
+# consumenten (Portfolio) met NUL aanroepers. De belofte was fictie.
+#
+# Deze check maakt 'm waar: hij leest de drie namen uit het contract en kijkt of ze bestaan.
+# Daarmee is `labels:` geen decoratie meer maar een gecontroleerde afspraak — dezelfde beweging
+# als I29 bij het verdictprotocol.
+#
+# ZACHT ZONDER `--repo`. De labels zijn alleen via de API te zien; zonder repo weet je niets, en
+# "ik weet het niet" mag hier geen bevinding worden (zelfde regel als I28 zonder `--fleet-root`).
+module_labelwoordenboek() {
+  local f="$1" py="$2"
+
+  local namen
+  namen="$("$py" - "$f" <<'PY' 2>/dev/null
+import sys
+try:
+    import yaml
+    d = yaml.safe_load(open(sys.argv[1], encoding="utf-8")) or {}
+except Exception:
+    raise SystemExit(0)
+lab = d.get("labels")
+if isinstance(lab, dict):
+    for sleutel in ("task", "human", "epic"):
+        naam = lab.get(sleutel)
+        if isinstance(naam, str) and naam.strip():
+            # GETRIMD doorgeven, niet ruw. Een `.fleet.yml` met CRLF-regeleindes (een checkout op
+            # Windows is genoeg) levert anders een naam die op `\r` eindigt, en dan meldt deze
+            # check dat élk contractlabel ontbreekt terwijl ze alle drie bestaan. Vier repo's
+            # tegelijk rood om een reden die niets met labels te maken heeft — precies het soort
+            # vals alarm dat een check ongeloofwaardig maakt.
+            print(f"{sleutel}\t{naam.strip()}")
+PY
+)"
+  [ -n "$namen" ] || return 0
+
+  if [ -z "$repo" ]; then
+    warn "I30: geen --repo meegegeven — of de contractlabels bestaan is ongetoetst"
+    return
+  fi
+  command -v gh >/dev/null 2>&1 || { warn "I30: gh ontbreekt — labels ongetoetst"; return; }
+
+  local bestaand
+  bestaand="$(gh label list --repo "$repo" --limit 200 --json name --jq '.[].name' 2>/dev/null || true)"
+  if [ -z "$bestaand" ]; then
+    warn "I30: kon de labels van $repo niet ophalen — ongetoetst"
+    return
+  fi
+
+  local mist=0 sleutel naam
+  while IFS=$'\t' read -r sleutel naam; do
+    # `\r` eraf. Python's stdout vertaalt op Windows elke `\n` naar `\r\n`, en `read` haalt alleen
+    # de `\n` weg — de naam eindigt dan op een carriage return en matcht nooit. Grillig genoeg
+    # ontsnapt de LAATSTE regel eraan (die heeft geen newline), dus de check meldde netjes dat
+    # `epic` bestond en de andere twee niet. Een fout die zich voordoet als een echte bevinding,
+    # en die in CI (Linux) onzichtbaar zou blijven tot iemand 'm lokaal draait.
+    naam="${naam%$'\r'}"; sleutel="${sleutel%$'\r'}"
+    [ -n "$naam" ] || continue
+    if printf '%s\n' "$bestaand" | grep -qxF "$naam"; then
+      ok "I30: contractlabel $sleutel = '$naam' bestaat"
+    else
+      bad "I30: contractlabel $sleutel = '$naam' bestaat NIET in $repo — een issue dat hierheen wordt verhuisd verliest dat label stilzwijgend, en een station dat erop wacht blijft wachten"
+      mist=1
+    fi
+  done <<< "$namen"
+  [ "$mist" = 0 ] || true
 }
 
 # ---------------------------------------------------------------------------------------------
