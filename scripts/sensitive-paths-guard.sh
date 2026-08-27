@@ -31,7 +31,8 @@
 # Dat lijkt karig, maar het is het meeste dat er te winnen valt: op de dag dat dit geschreven werd
 # waren vier van de zeven fleet-PR's documentatie.
 #
-# VIERDE KOPIE, EN DAT WETEN WE. Dit raamwerk staat nu in Portfolio, BiohackOS, InvestingOS én hier.
+# VIERDE KOPIE, EN DAT WETEN WE. Dit raamwerk staat nu bij meerdere consumenten — waaronder
+# BiohackOS en InvestingOS — én hier.
 # De analyse van 2026-08-23 wees uit dat VERHUIZEN naar fleet niet kan (fleet's stations draaien in
 # de werkmap van de aanroeper, dus een fleet-zijdige guard vereist een app-token dat elders al als
 # optioneel wordt behandeld — fail-open op een mens-poort), maar PARAMETRISEREN wel. Zolang dat er
@@ -115,7 +116,7 @@ if [ -n "${SELFTEST:-}" ]; then
 diff --git a/.github/workflows/y.yml b/.github/workflows/y.yml
 "
   # Een PURE HERNOEMING heeft geen +++/---regels. Wie daar alleen op leest ziet een lege diff, en
-  # een lege diff die CLEAN oplevert is de fail-open waar dit script tegen bestaat (Portfolio#216).
+  # een lege diff die CLEAN oplevert is de fail-open waar dit script tegen bestaat.
   proef "FORCE-APPROVAL:" "hernoemd naar .github/" "diff --git a/docs/x.md b/.github/workflows/nieuw.yml
 similarity index 100%
 rename from docs/x.md

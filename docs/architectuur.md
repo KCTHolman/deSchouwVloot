@@ -335,7 +335,7 @@ Zonder PR, met [`scripts/autonomie.sh`](../scripts/autonomie.sh):
 
 ```bash
 bash scripts/autonomie.sh status              # de stand van alle consumenten
-bash scripts/autonomie.sh set KCTHolman/Portfolio autonomous
+bash scripts/autonomie.sh set KCTHolman/fleet autonomous
 bash scripts/autonomie.sh halt KCTHolman/BiohackOS    # noodrem om
 ```
 

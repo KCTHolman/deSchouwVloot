@@ -419,8 +419,8 @@ else
   bad "onbekende --diff-vlag niet gevangen (rc=$rc)"; printf '%s\n' "$out" | sed 's/^/      /'
 fi
 
-# Een guard die alleen op `+++`/`---` leest, ziet een PURE hernoeming als een lege diff. Portfolio
-# gaf daar CLEAN op — je kon er elk bestand ongezien de workflowmap mee in verplaatsen. Deze test
+# Een guard die alleen op `+++`/`---` leest, ziet een PURE hernoeming als een lege diff. Eén
+# consument gaf daar CLEAN op — je kon er elk bestand ongezien de workflowmap mee in verplaatsen. Deze test
 # houdt vast dat een guard óók op die vorm een oordeel moet vellen.
 guardrepo "$T/i29ren" 'if grep -q "^+++" "$2" 2>/dev/null; then echo "CLEAN: gezien"; else exit 0; fi' --kent-diff
 out="$(bash "$DOCTOR" --module afhankelijkheden --root "$T/i29ren" --fleet-root "$T/i28fleet" 2>&1)"; rc=$?

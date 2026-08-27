@@ -18,8 +18,8 @@
 #
 # `alle` staat er omdat de vraag zelden over één repo gaat. Je zet de vloot om omdat je een week
 # weg bent, of je trekt aan de rem omdat er íets misgaat en je nog niet weet waar — in allebei de
-# gevallen is "vijf commando's, en hopen dat je er niet één vergeet" het verkeerde gereedschap.
-# Precies die vergeten vijfde is hoe een repo in een stand blijft staan die niemand koos.
+# gevallen is "drie commando's, en hopen dat je er niet één vergeet" het verkeerde gereedschap.
+# Precies die vergeten derde is hoe een repo in een stand blijft staan die niemand koos.
 #
 # `set … contract` VERWIJDERT de variabele, waarna `.fleet.yml` weer beslist. Dat is iets anders
 # dan `set … supervised` (die zet de repo actief op begeleid, óók als het contract autonoom zegt) —
@@ -36,8 +36,6 @@ CONSUMENTEN=(
   KCTHolman/fleet
   KCTHolman/BiohackOS
   KCTHolman/InvestingOS
-  KCTHolman/Portfolio
-  KCTHolman/fenix8-nightwatch
 )
 
 die() { echo "✋ autonomie: $*" >&2; exit 2; }

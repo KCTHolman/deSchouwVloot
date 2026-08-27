@@ -23,8 +23,8 @@
 #     needs-human  + label agent-geverifieerd  →  autonomie-beslis: mens · deze route: telt
 #
 # Dat maakt twee beloftes onwaar die elders hard staan opgeschreven: `autonomie-beslis.sh` §POORT 3
-# ("Ze moeten in élke stand werken, anders is 'ik kan overal ingrijpen' niet waar") en het
-# consumentcontract van Portfolio ("`FLEET_HALT` is het commando waarmee je 'm stopt zonder eerst
+# ("Ze moeten in élke stand werken, anders is 'ik kan overal ingrijpen' niet waar") en een
+# consumentcontract ("`FLEET_HALT` is het commando waarmee je 'm stopt zonder eerst
 # iets te hoeven begrijpen"). Het realistische scenario is niet exotisch: het label staat er al,
 # jij plakt `needs-human` erop om de PR te stoppen, en de volgende run merget 'm alsnog.
 #

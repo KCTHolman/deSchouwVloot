@@ -352,7 +352,7 @@ module_verdictprotocol() {
 
   # Twee vormen, allebei uit de echte praktijk. De tweede is een PURE hernoeming: die produceert
   # géén `+++`/`---`-regels, en een guard die alleen daarop leest ziet 'm als een lege diff.
-  # Portfolio's guard gaf daar CLEAN op — je kon er elk bestand ongezien de workflowmap mee in
+  # Eén consument's guard gaf daar CLEAN op — je kon er elk bestand ongezien de workflowmap mee in
   # verplaatsen (gerepareerd 2026-08-23).
   local -a vormen=(
     "gewone wijziging|diff --git a/README.md b/README.md
@@ -714,8 +714,8 @@ module_contract() {
 # verhuist issues tussen repo's; een label dat in de doelrepo niet bestaat, valt daar stil weg.
 # De belofte was dus dat die drie er zijn — en niets controleerde dat.
 #
-# De garantie hing aan `scripts/ensure-labels.sh`, en die bestaat in precies één van de vijf
-# consumenten (Portfolio) met NUL aanroepers. De belofte was fictie.
+# De garantie hing aan `scripts/ensure-labels.sh`, en die bestaat in precies één van de
+# consumenten, met NUL aanroepers. De belofte was fictie.
 #
 # Deze check maakt 'm waar: hij leest de drie namen uit het contract en kijkt of ze bestaan.
 # Daarmee is `labels:` geen decoratie meer maar een gecontroleerde afspraak — dezelfde beweging
