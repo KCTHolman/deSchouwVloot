@@ -13,7 +13,7 @@
 # Lokaal: bash scripts/noodrem-beslis.test.sh
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 REM="$PWD/scripts/noodrem-beslis.sh"
 
 fail=0

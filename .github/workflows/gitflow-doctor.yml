@@ -435,7 +435,7 @@ jobs:
             zb_rc=skip
             zb_out=""
           else
-            zb_out="$(GITHUB_ACTIONS= bash scripts/check-zombie-workflows.sh 2>&1)"; zb_rc=$?
+            zb_out="$(GITHUB_ACTIONS='' bash scripts/check-zombie-workflows.sh 2>&1)"; zb_rc=$?
             printf '%s\n' "$zb_out"
           fi
           case "$zb_rc" in
@@ -453,7 +453,7 @@ jobs:
           if [ ! -f scripts/check-fleet-config.sh ]; then
             echo "::notice::B2 overgeslagen — deze repo levert scripts/check-fleet-config.sh niet (guard is consument-eigen, zie I28)."
           elif [ -n "${PROJECT_TOKEN:-}" ]; then
-            fc_out="$(GITHUB_ACTIONS= GH_TOKEN="$PROJECT_TOKEN" bash scripts/check-fleet-config.sh 2>&1)"; fc_rc=$?
+            fc_out="$(GITHUB_ACTIONS='' GH_TOKEN="$PROJECT_TOKEN" bash scripts/check-fleet-config.sh 2>&1)"; fc_rc=$?
             printf '%s\n' "$fc_out"
             case "$fc_rc" in
               0) echo "B2 schoon — geen config-drift." ;;

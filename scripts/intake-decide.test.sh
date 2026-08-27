@@ -8,7 +8,7 @@
 # Lokaal: bash scripts/intake-decide.test.sh
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 
 DECIDE="scripts/intake-decide.sh"
 ROUTING="routing.yml"

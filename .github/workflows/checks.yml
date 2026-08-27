@@ -78,3 +78,62 @@ jobs:
             printf '✅ **Alles groen.**\n' | out
           fi
           exit "$rc"
+
+      - name: Statische analyse (shellcheck + actionlint)
+        # WAAROM DIT ER PAS NU IS. Tot 2026-08-23 ging ±1.970 regels bash — waarvan het grootste
+        # deel INLINE in workflows — door geen enkele parser. Een verkeerd geplaatste `fi` of een
+        # niet-gequote expansie bereikte `main` zonder dat iets rood werd. De testsuites toetsen
+        # alleen de scripts die er een hebben; dit toetst alles wat bash IS.
+        #
+        # WARNING EN HOGER, NIET STYLE/INFO. Op `info` geeft shellcheck 54 bevindingen die vrijwel
+        # allemaal SC2015 (`a && b || c`) en SC2016 (`$` in enkele quotes) zijn — beide bewuste
+        # idiomen in deze repo. Een poort die je leert wegkijken is geen poort.
+        #
+        # DEGRADEREN MAG, STIL VERDWIJNEN NIET. Lukt het installeren niet (netwerk), dan wordt dat
+        # een zichtbare ⚠️ in de samenvatting — nooit een stilzwijgend groen vinkje. Zelfde
+        # redenering als de `runners`-module van de doctor.
+        if: always()
+        shell: bash --noprofile --norc {0}
+        run: |
+          rc=0
+          out() { tee -a "$GITHUB_STEP_SUMMARY"; }
+          printf '\n## Statische analyse\n\n' | out
+
+          if command -v shellcheck >/dev/null 2>&1; then
+            printf '### shellcheck (severity: warning)\n\n```\n' | out
+            shellcheck --severity=warning --shell=bash scripts/*.sh 2>&1 | out
+            [ "${PIPESTATUS[0]}" -ne 0 ] && rc=1
+            printf '```\n\n' | out
+          else
+            printf '⚠️  shellcheck ontbreekt op deze runner — scripts ONGETOETST op syntaxis.\n\n' | out
+            echo "::warning::shellcheck ontbreekt — statische analyse van scripts/ overgeslagen."
+          fi
+
+          # actionlint is niet voorgeïnstalleerd; de officiële downloader zet 'm in de werkmap.
+          if [ ! -x ./actionlint ]; then
+            curl -fsSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash \
+              | bash >/dev/null 2>&1 || true
+          fi
+
+          if [ -x ./actionlint ]; then
+            # Wrapper zodat actionlints ingebouwde shellcheck óók op `warning` staat: zonder dit
+            # lekt elke style/info-melding uit de INLINE workflow-bash de poort in.
+            printf '#!/usr/bin/env bash\nexec shellcheck --severity=warning "$@"\n' > ./sc-warn
+            chmod +x ./sc-warn
+
+            printf '### actionlint (warning en hoger)\n\n```\n' | out
+            # `job_workflow_sha` IS een echte GitHub-context-property (gedocumenteerd voor reusable
+            # workflows); actionlints type-schema loopt daarop achter. Bewust genegeerd — niet
+            # omdat de melding lastig is, maar omdat 'ie aantoonbaar onjuist is.
+            ./actionlint -shellcheck ./sc-warn \
+              -ignore 'property "job_workflow_sha" is not defined' \
+              .github/workflows/*.yml 2>&1 | out
+            [ "${PIPESTATUS[0]}" -ne 0 ] && rc=1
+            printf '```\n\n' | out
+            rm -f ./actionlint ./sc-warn
+          else
+            printf '⚠️  actionlint niet op te halen — workflows ONGETOETST.\n\n' | out
+            echo "::warning::actionlint niet beschikbaar — statische analyse van workflows overgeslagen."
+          fi
+
+          exit "$rc"

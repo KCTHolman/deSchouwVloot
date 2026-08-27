@@ -8,7 +8,7 @@
 # Lokaal: bash scripts/bump-beslis.test.sh
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 BESLIS="$PWD/scripts/bump-beslis.sh"
 
 fail=0

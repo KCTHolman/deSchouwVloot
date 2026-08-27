@@ -12,7 +12,15 @@ name: "[fleet] Runner-fleet assert"
 # hierheen mét de drempel in `.fleet.yml` — maar dat is parametriseren (fase 3/M6), niet
 # verhuizen. Eerst een-op-een over; verbeteren is een aparte stap.
 #
-# Bewaakt de agent-lane-invariant: lane `biohack-agent` heeft precies één online runner.
+# Bewaakt de agent-lane-invariant: de agent-lane heeft niet MEER online runners dan de consument
+# bewezen aankan.
+#
+# LET OP — deze kop zei tot 2026-08-23 "precies één online runner". Dat klopt niet meer en klopte
+# al sinds 2026-07-27 niet: de opheffingsprocedure onderaan deze kop is toen doorlopen
+# (sessie-isolatie + gelijktijdigheidsproef #1698/#1699, PR #1700) en BiohackOS' script staat
+# sindsdien op `AGENT_LANE_MAX=2`. De handhaving zit in dát script, niet in deze tekst — en een
+# kop die strenger klinkt dan de check, laat iemand een tweede slot voor onmogelijk houden
+# terwijl het al een jaar mag.
 #
 # WAAROM DIT EEN CHECK IS EN GEEN AANNAME. Alle elf claude-code-action-workflows draaien op die
 # lane, en die ene runner is wat ze serialiseert — de gedeelde concurrency-group die dat vroeger

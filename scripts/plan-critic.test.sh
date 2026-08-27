@@ -9,7 +9,7 @@
 # Lokaal: bash scripts/plan-critic.test.sh
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 CRITIC="scripts/plan-critic.sh"
 
 fail=0

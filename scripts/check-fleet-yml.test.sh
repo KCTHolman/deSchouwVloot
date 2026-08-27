@@ -8,7 +8,7 @@
 # Lokaal: bash scripts/check-fleet-yml.test.sh
 
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 V="scripts/check-fleet-yml.py"
 
 fail=0

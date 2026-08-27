@@ -32,6 +32,24 @@ name: "[fleet] Auto-merge & promote"
 #   • Feature PR met GOEDGEKEURD PLAN (label `plan-goedgekeurd`, niet-breaking)
 #       → "gate één keer": het plan is in trap 2 al door de eigenaar goedgekeurd, dus deze merget op
 #         groene CI ZONDER tweede approval. GEEN automatische release (zie hieronder).
+#   • Feature PR met AGENT-GEVERIFIEERD (label `agent-geverifieerd`, niet-breaking) — nieuw,
+#     BiohackOS#2112 (2026-08-21): een TWEEDE "gate één keer"-route, naast plan-goedgekeurd. Het
+#     label komt van een ONAFHANKELIJKE verificatie-run (`agent-verify.yml`, nooit de bouwer zelf)
+#     die adversarieel toetst en alleen bij "geen bezwaar" het label zet.
+#
+#     DE VLOER GELDT HIER ÓÓK (2026-08-23). Deze route is een EIGEN UITGANG naast de
+#     autonomiestand — `agent-geverifieerd` is bewijs over ÉÉN PR, `autonomy.mode` is staand
+#     beleid over de repo — maar "eigen uitgang" mag nooit "eigen vloer" betekenen. De route telt
+#     dus NOOIT op een gevoelig pad, met de noodrem om (`FLEET_HALT`), met een stoplabel erop
+#     (`needs-human` / `no-automerge`), of op een breaking change — ongeacht wie het label zette.
+#     Tot deze wijziging las hij `FLEET_HALT` en `needs-human` niet, terwijl `elif $agent_ok`
+#     hieronder vóór `elif $autonoom` staat: de noodrem had daarmee een gat.
+#
+#     Daarnaast telt het label alleen als een vertrouwde actor het zette, en is de hele route uit
+#     te zetten met de repo-variabele `AGENT_ZELFGOEDKEURING_PAUZE` (circuit breaker na een
+#     teruggedraaide zelfgoedgekeurde merge) — die stopt alléén deze route, waar `FLEET_HALT` de
+#     hele repo stopt.
+#     Zie `scripts/agent-geverifieerd-beslis.sh` (offline-getest twin van de inline logica hieronder).
 #   • Feature zonder goedgekeurd plan / breaking PR — VOLAUTOMATISCH sinds 2026-07-20 (op
 #     expliciet verzoek van de eigenaar, zie chat + constitution.md §Versoepeld)
 #       → merge naar main zodra CI groen is ÉN (JOUW approval OF een APPROVED review van de
@@ -47,6 +65,27 @@ name: "[fleet] Auto-merge & promote"
 # Escape hatches (labels): `no-automerge` (nooit auto-mergen) · `hold-release` (blokkeert de
 # auto-error-auto-release; features releasen sinds #476 sowieso niet meer vanzelf).
 # `CHANGES_REQUESTED` van jou blokkeert altijd. PR's richting acc/lab/release: handmatig.
+#
+# DE AUTONOMIESTAND (2026-08-23). Al het bovenstaande beschrijft de BEGELEIDE stand: een feature
+# wacht op een mens. Sinds vandaag is dat een KEUZE in plaats van een eigenschap — `.fleet.yml`
+# krijgt een sectie `autonomy`, en de repo-variabele `FLEET_AUTONOMY` zet 'm om zonder PR:
+#
+#   supervised (default)  een feature/breaking PR wacht op jouw approval, een AI-review of een
+#                         goedgekeurd plan. Precies het beleid hierboven.
+#   autonomous            een groene feature-PR merget zichzelf. Breaking changes alleen als
+#                         `.fleet.yml` óók `autonomy.allow_breaking: true` zegt.
+#
+# En de vloer die in BEIDE standen blijft staan — dit is het deel dat telt:
+#   • de gevoelige-paden-guard wint altijd (secrets, migraties, de pijplijn zelf, nieuwe externe
+#     bestemmingen → jouw eigen approval, ook op autonoom);
+#   • `needs-human` en `no-automerge` stoppen altijd;
+#   • `CHANGES_REQUESTED` stopt altijd;
+#   • `FLEET_HALT` (repo-variabele) zet de hele repo in één keer terug naar mens-in-de-lus.
+#
+# De beslissing zelf staat in fleet's `scripts/autonomie-beslis.sh` (30 tests), niet in een `if`
+# hieronder — juist omdat de gevaarlijke tak (autonoom én een gevoelig pad) er een is die je bij
+# handmatig proberen nooit tegenkomt. Ontbreekt dat script (geen app-secrets), dan gedraagt deze
+# workflow zich exact zoals hiervoor: mens-in-de-lus.
 #
 # Drie triggers die samen elke volgorde afdekken: de PR-check die groen wordt, de
 # impactanalyse (feature-governance) die afrondt, én jouw approval.
@@ -117,12 +156,54 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
       OWNER: ${{ github.repository_owner }}
+      # Circuit breaker (BiohackOS#2112 acceptatiecriterium 6). Niet-leeg = de agent-geverifieerd-
+      # route staat stil, ongeacht welk label er op een PR staat. Koen zet 'm ná een teruggedraaide
+      # zelfgoedgekeurde merge; alleen hij zet 'm weer leeg.
+      PAUZE: ${{ vars.AGENT_ZELFGOEDKEURING_PAUZE }}
     steps:
       # Checkout is nodig zodat scripts/sensitive-paths-guard.sh (de gevoelige-paden-guard, epic
       # #360 fase 3) beschikbaar is. Draait op de default branch-versie (main) — daar staat de
       # gesanctioneerde guard, niet de PR-versie, zodat een PR z'n eigen guard niet kan verzwakken.
       - name: Checkout (voor de gevoelige-paden-guard)
         uses: actions/checkout@v7
+
+      # --- De autonomieschakelaar ophalen ------------------------------------------------------
+      # `autonomie-beslis.sh` woont in de fleet-repo (één plek, 30 tests), maar de checkout
+      # hierboven levert de AANROEPER op. Zelfde beweging als bump-pin.yml (`.fleet-lib`) en
+      # doctor.yml (`.fleet-doctor`): een tweede, read-only checkout van de fleet-repo.
+      #
+      # BEIDE STAPPEN ZIJN `continue-on-error`, EN DAT IS DE BELANGRIJKSTE REGEL HIER. Dit is een
+      # spine-workflow (I25): valt auto-merge om, dan blijven groene PR's stilletjes liggen zonder
+      # dat iets rood wordt. Een consument zonder `APP_ID`/`APP_PRIVATE_KEY` zou met een harde
+      # token-stap vanaf nu geen enkele PR meer mergen — een nieuwe faalklasse introduceren in de
+      # spine, om een schakelaar toe te voegen die diezelfde repo helemaal niet gebruikt.
+      #
+      # Mislukt een van beide, dan ontbreekt `.fleet-lib/scripts/autonomie-beslis.sh` en valt de
+      # evaluatiestap terug op `mens` — exact het gedrag van vóór deze wijziging. De degradatie is
+      # dus zichtbaar (in de log) én ongevaarlijk (features blijven op approval wachten).
+      - name: App-token munten (leestoegang tot de fleet-repo)
+        id: app
+        continue-on-error: true
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID || secrets.WORKFLOW_APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.WORKFLOW_APP_PRIVATE_KEY }}
+          owner: KCTHolman
+          repositories: fleet
+
+      - name: Fleet-scripts ophalen (autonomieschakelaar)
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          repository: KCTHolman/fleet
+          # `job_workflow_sha` is de commit van DEZE reusable workflow — niet van de caller. Zo
+          # draait het script altijd de versie die bij deze YAML hoort, zonder dat de caller een
+          # `with: fleet_ref` hoeft mee te geven (en dus zonder dat vijf consumenten moeten
+          # wijzigen om de schakelaar te krijgen).
+          ref: ${{ github.job_workflow_sha || 'main' }}
+          path: .fleet-lib
+          token: ${{ steps.app.outputs.token }}
+          persist-credentials: false
 
       - name: Bepaal PR-nummer
         id: pr
@@ -149,6 +230,15 @@ jobs:
         if: steps.pr.outputs.skip == 'false'
         env:
           NUM: ${{ steps.pr.outputs.num }}
+          # DE SCHAKELAAR EN DE NOODREM — repo-variabelen, geen bestanden. Een stand die je alleen
+          # met een PR kunt wijzigen, staat altijd te laat goed: op het moment dat je 'm om wil
+          # zetten (er gaat iets mis, of juist: het loopt goed en je wil doorschakelen) wil je niet
+          # eerst door je eigen poort. `gh variable set FLEET_AUTONOMY autonomous` en de volgende
+          # run draait anders.
+          #
+          # Niet gezet = leeg = het contract beslist (`.fleet.yml`, sectie `autonomy`).
+          FLEET_AUTONOMY: ${{ vars.FLEET_AUTONOMY }}
+          FLEET_HALT: ${{ vars.FLEET_HALT }}
         run: |
           set -euo pipefail
           json="$(gh pr view "$NUM" --repo "$REPO" \
@@ -308,11 +398,17 @@ jobs:
               -H 'Accept: application/vnd.github+json' 2>/dev/null \
               | jq -rs '[.[][] | select(.event=="labeled" and .label.name=="plan-goedgekeurd") | .actor.login] | last // ""' \
               2>/dev/null || true)"
+            # LEGE LABELER EERST. Stond deze tak onder de vertrouwde-actors-tak, dan matchte een
+            # lege `$labeler` op het patroon `"$OWNER"` zodra `$OWNER` zelf leeg is — en dan is
+            # "ik kon de herkomst niet bepalen" ineens "de eigenaar zette het". Fail-OPEN op de
+            # poort die juist herkomst moet bewijzen. `github.repository_owner` is in de praktijk
+            # altijd gevuld, dus dit was latent; maar de volgorde mag niet de enige reden zijn dat
+            # het goed gaat. Zelfde correctie hieronder bij agent-geverifieerd.
             case "$labeler" in
-              "$OWNER"|'claude[bot]'|'github-actions[bot]'|'defleet-machinerie[bot]')
-                plan_ok=true ;;
               "")
                 echo "::warning::Kon herkomst van plan-goedgekeurd niet bepalen — niet als goedgekeurd plan behandeld." ;;
+              "$OWNER"|'claude[bot]'|'github-actions[bot]'|'defleet-machinerie[bot]')
+                plan_ok=true ;;
               *)
                 echo "::warning::plan-goedgekeurd gezet door onvertrouwde actor '$labeler' — genegeerd (geen gate-één-keer)." ;;
             esac
@@ -347,6 +443,109 @@ jobs:
           fi
           rm -f "$diff_file"
 
+          # --- AGENT-GEVERIFIEERD: onafhankelijke zelfgoedkeuring (BiohackOS#2112) ----------
+          # Naast plan_ok hierboven een tweede "gate één keer"-route: een niet-breaking feature-/
+          # epic-fase-PR mag ook mergen op het label `agent-geverifieerd` — gezet door de
+          # ONAFHANKELIJKE verificatie-run `agent-verify.yml` (nooit door de bouwer zelf, nooit
+          # door iemand die het label handmatig zet). Zelfde provenance-eis als plan_ok, plus twee
+          # harde nee's die GEEN enkele actor (ook Koen niet, als 'ie het label per ongeluk zelf
+          # zet) kan overrulen: nooit op een breaking change, nooit op een gevoelig pad.
+          #
+          # Dit blok is een INLINE kopie van scripts/agent-geverifieerd-beslis.sh (offline getest,
+          # 15 gevallen) — deze stap draait in de checkout van de CONSUMENT (BiohackOS), die
+          # fleet's eigen scripts/ niet heeft; zelfde reden als de INLINE claude-run-summary-kopie
+          # in pr-conflict-solver.yml. Wijzig je de logica, wijzig het script + de tests mee.
+          # VOLGORDE IDENTIEK AAN scripts/agent-geverifieerd-beslis.sh: circuit breaker, dan de
+          # VLOER (gevoelig pad → noodrem → stoplabels → breaking), dan provenance. Wie de twee
+          # naast elkaar legt, hoort dezelfde poorten in dezelfde volgorde te zien — dat is de
+          # enige manier waarop een "inline twin" op termijn eerlijk blijft.
+          agent_ok=false
+          if has 'agent-geverifieerd'; then
+            # De noodrem, met dezelfde omgekeerde vraag als autonomie-beslis.sh: ELKE waarde is de
+            # rem, behalve de expliciete "uit"-waarden. Bij een noodrem is de dure fout dat 'ie
+            # niet pakt, niet dat 'ie te vaak pakt.
+            agv_halt_om=false
+            case "$(printf '%s' "${FLEET_HALT:-}" | tr '[:upper:]' '[:lower:]')" in
+              ''|0|false|no|nee|off|uit) : ;;
+              *) agv_halt_om=true ;;
+            esac
+            if [ -n "${PAUZE:-}" ]; then
+              echo "agent-geverifieerd: route gepauzeerd (circuit breaker, vars.AGENT_ZELFGOEDKEURING_PAUZE) — genegeerd."
+            elif [ "$sensitive" = "true" ]; then
+              echo "agent-geverifieerd: gevoelig pad — telt hier nooit mee, net als plan-goedgekeurd/ai_approved. $sensitive_reason"
+            elif $agv_halt_om; then
+              # DE NOODREM (toegevoegd 2026-08-23). Deze tak ontbrak, en dat was geen detail:
+              # FLEET_HALT werd UITSLUITEND door autonomie-beslis.sh gelezen, terwijl `elif
+              # $agent_ok` hieronder vóór `elif $autonoom` staat. Met de rem om merget deze route
+              # dus alsnog — precies de knop die je omzet als je nog niet weet wát er mis is.
+              echo "agent-geverifieerd: noodrem staat om (FLEET_HALT='${FLEET_HALT:-}') — genegeerd."
+            elif has 'needs-human'; then
+              # `no-automerge` wordt hierboven al afgevangen met een vroege exit; `needs-human`
+              # niet — en juist die is de handgreep waarmee je een PR stopt die het label AL
+              # draagt. Zonder deze tak merget zo'n PR door terwijl jij 'm net stilzette.
+              echo "agent-geverifieerd: label needs-human staat erop — een mens heeft deze bewust stilgezet."
+            elif $breaking; then
+              echo "agent-geverifieerd: breaking change — telt hier nooit mee (acceptatiecriterium BiohackOS#2112)."
+            else
+              agv_labeler="$(gh api --paginate "repos/$REPO/issues/$NUM/timeline" \
+                -H 'Accept: application/vnd.github+json' 2>/dev/null \
+                | jq -rs '[.[][] | select(.event=="labeled" and .label.name=="agent-geverifieerd") | .actor.login] | last // ""' \
+                2>/dev/null || true)"
+              # LEGE LABELER EERST — zie de toelichting bij plan-goedgekeurd hierboven. Het script
+              # `agent-geverifieerd-beslis.sh` toetst `[ -z "$labeler" ]` als aparte stap vóór de
+              # vertrouwde-set en fail-closed dus altijd; deze tweeling deed dat niet en week
+              # daarmee af van precies de eigenschap die de suite vastlegt.
+              case "$agv_labeler" in
+                "")
+                  echo "::warning::Kon herkomst van agent-geverifieerd niet bepalen — niet gehonoreerd." ;;
+                "$OWNER"|'claude[bot]'|'github-actions[bot]'|'defleet-machinerie[bot]')
+                  agent_ok=true ;;
+                *)
+                  echo "::warning::agent-geverifieerd gezet door onvertrouwde actor '$agv_labeler' — genegeerd." ;;
+              esac
+            fi
+          fi
+          audit_comment=""
+
+          # --- DE AUTONOMIESTAND VAN DEZE REPO ---------------------------------------------
+          # Tot hier is het beleid hierboven ongewijzigd: een feature wacht op een mens. Dat was
+          # jarenlang de enige stand, en `gates.feature_approval` in `.fleet.yml` beschreef 'm
+          # wel maar stuurde 'm niet aan — geen enkele workflow las die sleutel. Een contract dat
+          # iets belooft wat de machinerie niet uitvoert, is erger dan geen contract.
+          #
+          # `autonomie-beslis.sh` maakt de stand expliciet én schakelbaar. Wat 'ie NIET doet is
+          # even belangrijk: hij kan de gevoelige-paden-guard niet overrulen, geen stoplabel
+          # negeren, en geen breaking change doorlaten die het contract niet toestaat. Die vier
+          # poorten liggen in het script vóór de schakelaar, met een test per stuk — juist omdat
+          # de gevaarlijke tak (repo staat op autonoom én de PR raakt supabase/migrations/**) de
+          # tak is die je met de hand nooit tegenkomt.
+          #
+          # Ontbreekt het script (geen app-secrets, fleet-checkout mislukt), dan is de uitkomst
+          # `mens` en gedraagt deze workflow zich exact als vóór de schakelaar.
+          autonoom=false; autonomie_reden="fleet-scripts niet beschikbaar — mens-in-de-lus"
+          if [ -r .fleet-lib/scripts/autonomie-beslis.sh ]; then
+            aut_log="$(mktemp)"
+            autonomie_uit="$(bash .fleet-lib/scripts/autonomie-beslis.sh \
+              --station merge \
+              --contract .fleet.yml \
+              --override "${FLEET_AUTONOMY:-}" \
+              --halt "${FLEET_HALT:-}" \
+              --labels "$labels" \
+              --breaking "$breaking" \
+              --sensitive "$sensitive" 2> "$aut_log" || echo mens)"
+            autonomie_reden="$(sed -n 's/^reden: //p' "$aut_log" | head -1)"
+            [ "$autonomie_uit" = "autonoom" ] && autonoom=true
+            rm -f "$aut_log"
+          fi
+          echo "Autonomiestand (station merge): $($autonoom && echo autonoom || echo mens) — $autonomie_reden"
+          {
+            echo "### Autonomiestand"
+            echo
+            echo "- station: \`merge\`"
+            echo "- uitkomst: **$($autonoom && echo autonoom || echo 'mens-in-de-lus')**"
+            echo "- reden: $autonomie_reden"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
           # Is dit een `fix`-PR? (De auto-error-auto-release-escalatie geldt uitsluitend voor
           # non-breaking fixes; een auto-error op een chore/docs volgt de normale kleine-PR-route.)
           isfix=false
@@ -360,8 +559,14 @@ jobs:
             # (label plan-goedgekeurd) mag mergen zonder tweede approval. Breaking changes en
             # features zónder goedgekeurd plan blijven via jouw expliciete PR-approval.
             if $breaking; then
-              if ! { $approved || $ai_approved; }; then
-                echo "Breaking change wacht op jouw approval of een APPROVED AI-review (ook mét plan)."; exit 0
+              # `$autonoom` is hier alleen waar als het contract `autonomy.allow_breaking: true`
+              # zegt — die sleutel staat bewust NIET in de repo-variabele, want "mag zonder mens
+              # doorbreken wat er is" hoort de wrijving van een PR te kosten.
+              if ! { $approved || $ai_approved || $autonoom; }; then
+                echo "Breaking change wacht op jouw approval of een APPROVED AI-review (ook mét plan)."
+                echo "Autonome stand zou dit ook doorlaten, maar dan moet .fleet.yml expliciet"
+                echo "\`autonomy.allow_breaking: true\` zeggen — nu: $autonomie_reden"
+                exit 0
               fi
               # Breaking op een gevoelig pad: AI-approve volstaat nooit, ook al is dit een
               # breaking change — dezelfde harde grens als bij feature/kleine-PR hieronder.
@@ -370,7 +575,8 @@ jobs:
                 echo "Wacht op jouw expliciete PR-approval."; exit 0
               fi
               if $approved; then echo "Breaking approved (owner) + groen → merge naar main."
-              else echo "Breaking approved (AI-review) + groen → merge naar main."; fi
+              elif $ai_approved; then echo "Breaking approved (AI-review) + groen → merge naar main."
+              else echo "Breaking + autonome stand (allow_breaking) + groen → merge naar main. $autonomie_reden"; fi
             elif $plan_ok; then
               # Issue #570: "gate één keer" dekt de FEATURE-scope die de eigenaar in trap 2 goedkeurde —
               # geen vrijbrief voor een gevoelig pad dat pas in de uitvoering opduikt (bv. een
@@ -381,6 +587,11 @@ jobs:
                 echo "Wacht op jouw expliciete PR-approval."; exit 0
               fi
               echo "Feature met goedgekeurd plan (gate één keer) + groen → merge naar main."
+            elif $agent_ok; then
+              # Geen aparte gevoelige-paden-check hier nodig: $agent_ok is al `false` zodra
+              # $sensitive=true (zie hierboven) — dezelfde harde grens als plan_ok/ai_approved.
+              echo "Feature agent-geverifieerd (onafhankelijke verificatie, BiohackOS#2112) + groen → merge naar main."
+              audit_comment="🤖 **Zelf goedgekeurd via onafhankelijke verificatie** — label \`agent-geverifieerd\` (niet-breaking, geen gevoelig pad, route niet gepauzeerd). Verslag: zie de PR-comment van \`agent-verify.yml\` hierboven. Voorwaarden: \`scripts/agent-geverifieerd-beslis.sh\`."
             elif $approved || $ai_approved; then
               # Zelfde gevoelige-paden-uitzondering als de plan_ok-tak hierboven: een AI-approve
               # op een gevoelig pad volstaat nooit — alleen jouw eigen approval telt daar.
@@ -390,8 +601,21 @@ jobs:
               fi
               if $approved; then echo "Feature approved (owner) + groen → merge naar main."
               else echo "Feature approved (AI-review) + groen → merge naar main."; fi
+            elif $autonoom; then
+              # DE AUTONOME ROUTE. Merget een feature op groen zonder dat iemand keek — precies wat
+              # de stand belooft, en precies waarom de vloer eronder zo hard is. Op dit punt staat
+              # al vast dat: de guard schoon is (poort 1), de noodrem uit staat (poort 2), er geen
+              # stoplabel ligt (poort 3), en dit geen breaking change is (poort 4, want die tak
+              # ligt hierboven). Wat overblijft is een groene feature-PR in een repo waarvan de
+              # eigenaar heeft gezegd: die hoef ik niet te zien.
+              #
+              # Merkbaar blijft het wél: de reden staat in de log én in de Step Summary, en de
+              # merge is één squash-commit die met één `git revert` terug kan.
+              echo "Feature + autonome stand + groen → merge naar main (geen mensgate). $autonomie_reden"
             else
-              echo "Feature wacht op jouw plan-akkoord (label plan-goedgekeurd), jouw PR-approval, of een APPROVED AI-review."; exit 0
+              echo "Feature wacht op jouw plan-akkoord (label plan-goedgekeurd), jouw PR-approval, of een APPROVED AI-review."
+              echo "Of zet deze repo op autonoom (\`gh variable set FLEET_AUTONOMY autonomous\`) — nu: $autonomie_reden"
+              exit 0
             fi
             # RELEASE NIET MEER AUTOMATISCH (issue #476): een feature/breaking-merge promoot
             # `main → release` niet langer vanzelf — dat triggerde één dure gesignde-APK-build per
@@ -432,6 +656,14 @@ jobs:
             else
               echo "Kleine niet-breaking PR + groen → merge naar main (geen release)."
             fi
+          fi
+
+          # Traceerbare audit-comment vóór de merge (BiohackOS#2112 acceptatiecriterium 5) —
+          # alléén gezet als deze PR via de agent-geverifieerd-route merget. Vóór i.p.v. ná de
+          # merge: een squash-merge sluit de PR-conversatie niet af, dus dit komt gewoon aan.
+          if [ -n "$audit_comment" ]; then
+            gh pr comment "$NUM" --repo "$REPO" --body "$audit_comment" \
+              || echo "::warning::Kon audit-comment niet plaatsen (merge gaat wel door)."
           fi
 
           # --body expliciet meegeven: zonder deze vlag stelt gh de squash-commit samen uit de
@@ -492,7 +724,7 @@ jobs:
             if [ -n "$stacked_prs" ]; then
               for spr in $stacked_prs; do
                 cur_base=""
-                for attempt in 1 2 3; do
+                for _ in 1 2 3; do
                   cur_base="$(gh pr view "$spr" --repo "$REPO" --json baseRefName \
                     --jq '.baseRefName' 2>/dev/null || echo "")"
                   [ "$cur_base" != "$head_branch" ] && break

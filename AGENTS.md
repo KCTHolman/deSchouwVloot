@@ -19,9 +19,46 @@ niet.
 
 ## Bron-hiërarchie
 
-deFleet heeft géén eigen constitution. De grondwet van een consument geldt voor het werk dát die
-consument doet; deze repo levert alleen de machinerie eromheen. Bij twijfel of iets fleet- of
-domeinlogica is: staat er een productnaam, een tabelnaam of een toolchain in, dan is het domein.
+deFleet heeft géén eigen constitution voor domeinwerk. De grondwet van een consument geldt voor
+het werk dát die consument doet; deze repo levert alleen de machinerie eromheen. Bij twijfel of
+iets fleet- of domeinlogica is: staat er een productnaam, een tabelnaam of een toolchain in, dan
+is het domein. Voor **fleet's eigen werkadministratie** (issues/epics in déze repo, label
+`fleet-task`) geldt wél een eigen, smal mandaat — zie hieronder.
+
+## Poort #1 (feature-approval) — zelf te sluiten op fleet's eigen werk (2026-08-21)
+
+**Vastgelegd op expliciet verzoek van Koen.** Er blijven **twee** mens-poorten
+([gitflow.md §1](docs/gitflow.md) / [architectuur.md §3](docs/architectuur.md)): feature-approval
+en release-approval. Wat wijzigt is **hoe poort #1 gesloten mag worden** wanneer het gaat om
+**déze repo's eigen fleet-task-werk** (nooit consumentwerk — dat blijft onder de grondwet van die
+consument): een CLI-/agentsessie mag zelfstandig een issue/epic aanmaken, via de CLI oplossen
+(branch → PR, dezelfde conventies als de machinerie: conventional-commit-titel, `Fixes #N`, één
+issue = één PR) en poort #1 zelf sluiten — zelf mergen + het issue sluiten, zonder op Koens
+PR-approval te wachten — **uitsluitend** wanneer **alle** onderstaande voorwaarden gelden.
+Ontbreekt er ook maar één, dan sluit poort #1 zoals altijd: wachten op Koens approval (of
+app-identiteit + approval, zie gitflow.md §1).
+
+**Voorwaarden om poort #1 zelf te sluiten (alle vier, geen uitzondering):**
+
+- **Groen, zonder omweg.** Alle vereiste checks (`PR check gate`, `impactanalyse`,
+  `consistency-doctor` waar van toepassing) staan groen. Nooit een rode of `SKIPPED` check
+  overrulen, nooit `gh run rerun` gebruiken om "groen" te forceren (draaiboekpunt 2).
+- **Binnen de harde grenzen.** Geen gezondheidsdata, geen secrets, geen host-mutatie, I1
+  (`workflow_call`-uitsluitendheid) intact, en verhuizen ≠ verbeteren — precies de vier grenzen
+  bovenaan dit document, ongewijzigd.
+- **Niet de spine, niet deze bevoegdheid zelf.** Wijzigingen aan `auto-merge.yml` (de spine, "hoog
+  risico" in architectuur.md §9) of aan déze paragraaf zelf blijven altijd eigenaar-only, ook als
+  de checks toevallig groen zijn. Zelfverruiming van deze bevoegdheid is er per definitie van
+  uitgesloten.
+- **Bewijs in de PR.** De PR-body benoemt expliciet dat poort #1 zelf gesloten is en welke van de
+  bovenstaande voorwaarden zijn geverifieerd — dat is het controleerbare spoor achteraf, in de
+  geest van het bewijsplicht-principe (gitflow.md §13.B).
+
+**Wat expliciet ongewijzigd blijft:** poort #2 (release-approval, production-Environment met
+required reviewer), elk `owner-gate`-gelabeld issue, credential-/host-/org-stappen, en
+`needs-human`-escalaties. Er komt geen derde poort bij — dit is uitsluitend een andere manier om
+poort #1 te sluiten, beperkt tot deFleet's eigen repo. Twijfel of iets binnen deze voorwaarden
+valt → de standaardregel (wachten op Koen) geldt, nooit andersom.
 
 ## Conventies
 
