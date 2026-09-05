@@ -78,11 +78,11 @@ jobs:
       # De gebieden komen uit `.fleet.yml` van de consument. Daarvoor is zowel diens checkout
       # nodig (het contract zelf) als die van deze repo (het leesscript).
       - name: Aanroeper uitchecken
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: App-token munten (leestoegang tot de fleet-repo)
         id: app
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2
         with:
           app-id: ${{ secrets.APP_ID || secrets.WORKFLOW_APP_ID }}
           private-key: ${{ secrets.APP_PRIVATE_KEY || secrets.WORKFLOW_APP_PRIVATE_KEY }}
@@ -90,7 +90,7 @@ jobs:
           repositories: fleet
 
       - name: Fleet-scripts ophalen
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           repository: KCTHolman/fleet
           ref: main

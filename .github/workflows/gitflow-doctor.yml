@@ -92,7 +92,7 @@ jobs:
       # Checkout nodig sinds fase 3 (epic #1168): de B1/B2-guards draaien als scripts uit de repo
       # (scripts/check-zombie-workflows.sh + scripts/check-fleet-config.sh). De failure-scan
       # hieronder gebruikt puur `gh api` en heeft de checkout niet nodig, maar hindert er niet van.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 1
 
