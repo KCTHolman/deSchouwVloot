@@ -153,6 +153,34 @@ verwacht "allow_breaking als string" ongeldig \
 verwacht "stations als lijst i.p.v. mapping" ongeldig \
   "$(geldig_contract "$(printf 'autonomy:\n  mode: supervised\n  stations:\n    - merge\n')")" "moet een mapping zijn"
 
+# BESCHRIJVENDE SLEUTELS (fleet#176). Ze horen een ⚠️ te geven ZONDER de exitcode te raken: een
+# contract met `default_model` is geldig, alleen gelooft de lezer een knop zonder draad. Beide
+# helften worden getoetst — de waarschuwing staat er, en exit blijft 0 — want een waarschuwing die
+# stiekem rood wordt, zet elk bestaand contract van de ene op de andere dag stuk.
+echo "check-fleet-yml · beschrijvende sleutels waarschuwen zonder de exitcode te raken:"
+printf '%s' "$(geldig_contract)" > "$T/w.yml"
+out="$(python "$V" "$T/w.yml" 2>&1)"; rc=$?
+if [ "$rc" = 0 ] && printf '%s' "$out" | grep -q '`budgets.default_model` beschrijft alleen'; then
+  ok "default_model geeft een ⚠️ bij exit 0"
+else
+  bad "default_model: verwacht ⚠️ bij exit 0 (exit $rc)"; printf '%s
+' "$out" | sed 's/^/      /'
+fi
+if printf '%s' "$out" | grep -q '`gates.feature_approval` beschrijft alleen'; then
+  ok "feature_approval geeft een ⚠️"
+else
+  bad "feature_approval: verwacht ⚠️"; printf '%s
+' "$out" | sed 's/^/      /'
+fi
+# Zonder de sleutel geen waarschuwing: de ⚠️ hoort bij wat er stáát, niet bij het schema.
+printf '%s' "$(geldig_contract | sed '/escalation_model/d')" > "$T/w2.yml"
+out="$(python "$V" "$T/w2.yml" 2>&1)"
+if printf '%s' "$out" | grep -q 'escalation_model'; then
+  bad "escalation_model: waarschuwing zonder dat de sleutel er staat"
+else
+  ok "geen waarschuwing voor een sleutel die er niet staat"
+fi
+
 echo "check-fleet-yml · het echte contract van deze repo:"
 out="$(python "$V" .fleet.yml 2>&1)"; rc=$?
 [ "$rc" = 0 ] && ok "deFleet's eigen .fleet.yml is geldig" || { bad "deFleet's eigen .fleet.yml"; printf '%s\n' "$out" | sed 's/^/      /'; }
