@@ -46,7 +46,7 @@ jobs:
       # "kon de actual state niet lezen" hierboven, niet als een kapotte workflow).
       GH_TOKEN: ${{ secrets.ASSERT_ADMIN_TOKEN || github.token }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: yq (mikefarah) installeren indien afwezig
         # github-hosted ubuntu-runners hebben mikefarah/yq al in de tool-cache; de
         # self-hosted-eerst-routering (#789) kan deze job ook op de self-hosted lane plaatsen,
