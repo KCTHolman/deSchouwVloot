@@ -58,6 +58,23 @@ AUTONOMIE_STATIONS = {"merge"}
 # (`gh variable set FLEET_AUTONOMY`), en dan is `autonoom` de waarde die je intikt.
 AUTONOMIE_WAARDEN = {"supervised", "autonomous", "mens", "begeleid", "autonoom"}
 
+# SLEUTELS DIE BESCHRIJVEN EN NIETS STUREN (fleet#176). Ze staan in elk contract, en geen enkel
+# station leest ze: `gates.feature_approval` (sturend is `autonomy`, sinds 2026-08-23) en
+# `budgets.default_model`/`escalation_model` (de modelkeuze zit in een `workflow_call`-input van
+# het station en in de beslistabel van de claude.yml-caller). Ze zijn geen fout — een contract mag
+# een intentie dragen — maar wie ze zet, verwacht een effect dat er niet is. Fleet's eigen
+# contract zegt dat er al bij; vijf consumentkopieën deden dat niet (driftaudit 2026-09-03), en
+# een agent die zo'n kopie leest gelooft een knop zonder draad.
+#
+# Daarom een ⚠️ en geen ❌: de exitcode verandert niet, de lezer wordt gewaarschuwd. Verdwijnt
+# een sleutel uit deze lijst, dan hoort dat in dezelfde PR te gebeuren als de code die 'm gaat
+# lezen — precies zoals AUTONOMIE_STATIONS hierboven per gewired station groeit.
+BESCHRIJVEND = {
+    "gates.feature_approval": "sturend is `autonomy.mode`; geen station leest deze sleutel",
+    "budgets.default_model": "geen station leest dit; het model zit in een workflow_call-input van het station",
+    "budgets.escalation_model": "geen station escaleert naar een ander model; escalatie is `needs-human`",
+}
+
 SCHEMA = {
     "version": {"type": int, "required": True},
     "lanes": {
@@ -288,6 +305,13 @@ def main():
         return 1
 
     print("  ✅ alle secties aanwezig, geen onbekende sleutels")
+
+    # Pas ná de harde toets: een ongeldig contract krijgt fouten, geen waarschuwingen erbovenop.
+    for pad_sleutel, reden in BESCHRIJVEND.items():
+        sectie, sleutel = pad_sleutel.split(".", 1)
+        if isinstance(data.get(sectie), dict) and sleutel in data[sectie]:
+            print(f"  ⚠️  `{pad_sleutel}` beschrijft alleen — {reden}")
+
     print("──")
     print("✅ contract geldig")
     return 0
